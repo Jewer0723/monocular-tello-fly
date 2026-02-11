@@ -1,0 +1,12 @@
+opencv-python~=4.13.0.90
+numpy~=1.24.4
+pygame~=2.6.1
+torch~=2.4.1+cu118
+djitellopy~=2.5.0
+ultralytics~=8.4.8
+gradio~=4.29.0
+matplotlib~=3.7.5
+pillow~=10.4.0
+setuptools~=68.2.0
+torchvision~=0.19.1+cu118
+pyzbar~=0.1.9
