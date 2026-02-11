@@ -4,10 +4,10 @@ import numpy as np
 from djitellopy import Tello
 import time
 from collections import deque
-from ..manual import manual_control
-from ..utils import midas_utils
-from ..utils import cv2_utils
-from ..utils import right_turn_utils
+import manual_control
+import cv2_utils
+import midas_utils
+import right_turn_utils
 
 # =====================
 # 裝置設定

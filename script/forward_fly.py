@@ -1,7 +1,7 @@
 from djitellopy import Tello
 from ultralytics import YOLO
 import cv2
-from ..manual import manual_control
+import manual_control
 
 # =======================
 # 參數設定
@@ -21,7 +21,7 @@ DEADZONE = 20
 # =======================
 # 初始化 YOLO
 # =======================
-model = YOLO("../../model/box1.pt")
+model = YOLO("../model/box1.pt")
 
 # =======================
 # 初始化 Tello
