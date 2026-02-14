@@ -31,8 +31,6 @@ tello.connect()
 print("Battery:", tello.get_battery())
 tello.streamon()
 
-manual_mode = True
-
 def clamp(val, minv, maxv):
     return max(min(val, maxv), minv)
 
@@ -93,7 +91,10 @@ while True:
             error_area = TARGET_AREA - bbox_area
 
             if abs(error_x) > DEADZONE:
-                yaw = clamp(int(KP_YAW * error_x), -MAX_SPEED, MAX_SPEED)
+                if abs(error_x) > 120:
+                    left_right = clamp(int(KP_YAW * error_x), -MAX_SPEED, MAX_SPEED)
+                else:
+                    yaw = clamp(int(KP_YAW * error_x), -MAX_SPEED, MAX_SPEED)
 
             if abs(error_y) > DEADZONE:
                 up_down = clamp(int(-KP_UPDOWN * error_y), -MAX_SPEED, MAX_SPEED)
