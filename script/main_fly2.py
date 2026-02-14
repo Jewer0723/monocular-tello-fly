@@ -49,7 +49,7 @@ FORWARD_CONFIG = {
     "MAX_SPEED": 20,
     "DEADZONE": 20,
     "MIN_AREA": 30000,              # 最小有效面積（低於此視為丟失目標）
-    "TARGET_LOST_TIMEOUT": 5,       # 目標丟失10秒就放棄追蹤
+    "TARGET_LOST_TIMEOUT": 3,       # 目標丟失3秒就放棄追蹤
     "MAX_EXECUTION_TIME": 30,       # 最長追蹤30秒（超過返回巡航，不降落）
 }
 
@@ -58,7 +58,7 @@ CIRCLE_CONFIG = {
     "ORBIT_SPEED": 9,
     "MIN_SCAN_TIME": 10,           # 最少掃描10秒
     "MAX_SCAN_TIME": 50,           # 最多掃描50秒
-    "TARGET_LOST_TIMEOUT": 5,      # 目標丟失10秒就放棄環繞
+    "TARGET_LOST_TIMEOUT": 3,      # 目標丟失3秒就放棄環繞
     "ALTITUDE_OFFSET": 30,         # 切換模式時的高度調整
     "CSV_FILE": "scanned_codes.csv"
 }
@@ -196,7 +196,7 @@ class MidASCruiser:
 class ForwardTracker:
     """前進接近目標，不進行避障"""
     def __init__(self):
-        self.model = YOLO("../model/box1.pt")
+        self.model = YOLO("../model/box2.pt")
         self.has_target = False
         self.target_lost_time = None
         self.start_time = None
@@ -304,7 +304,7 @@ class ForwardTracker:
 class CircleScanner:
     """環繞目標並掃描條碼"""
     def __init__(self):
-        self.model = YOLO("../model/box1.pt")
+        self.model = YOLO("../model/box2.pt")
         self.start_time = None
         self.has_target = False
         self.target_lost_time = None
@@ -364,7 +364,7 @@ class CircleScanner:
                                      FORWARD_CONFIG["MAX_SPEED"])
 
             if abs(error_area) > FORWARD_CONFIG["AREA_TOLERANCE"]:
-                up_down = self._clamp(int(-FORWARD_CONFIG["KP_FORWARD"] * error_area),
+                forward = self._clamp(int(FORWARD_CONFIG["KP_FORWARD"] * error_area),
                                      -FORWARD_CONFIG["MAX_SPEED"],
                                      FORWARD_CONFIG["MAX_SPEED"])
 
