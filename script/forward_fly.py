@@ -21,7 +21,7 @@ DEADZONE = 20
 # =======================
 # 初始化 YOLO
 # =======================
-model = YOLO("../model/box1.pt")
+model = YOLO("../model/logistics.pt")
 
 # =======================
 # 初始化 Tello

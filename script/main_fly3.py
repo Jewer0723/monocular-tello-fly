@@ -40,7 +40,7 @@ MIDAS_CONFIG = {
 
 # ===================== 前進追蹤參數 =====================
 FORWARD_CONFIG = {
-    "TARGET_AREA": 120000,            # 目標面積（環繞時要保持的面積）
+    "TARGET_AREA": 100000,            # 目標面積（環繞時要保持的面積）
     "AREA_TOLERANCE": 15000,
     "KP_YAW": 0.3,
     "KP_UPDOWN": 0.3,
@@ -48,37 +48,38 @@ FORWARD_CONFIG = {
     "MAX_SPEED": 20,
     "DEADZONE": 20,
     "MIN_AREA": 30000,
-    "TARGET_LOST_TIMEOUT": 3,
-    "MAX_EXECUTION_TIME": 30,
+    "TARGET_LOST_TIMEOUT": 2,
+    "MAX_EXECUTION_TIME": 30,          # 最長執行時間
 }
 
 # ===================== 環繞掃描參數 =====================
 CIRCLE_CONFIG = {
-    "ORBIT_SPEED": 8,
+    "ORBIT_SPEED": 7,
     "YAW_CORRECTION_SPEED": 12,
-    "HEIGHT_CORRECTION_SPEED": 8,
+    "HEIGHT_CORRECTION_SPEED": 10,
     "MIN_CIRCLE_TIME": 5,              # 最少環繞5秒
     "MAX_CIRCLE_TIME": 30,              # 最多環繞30秒
     "TARGET_LOST_TIMEOUT": 2,
     "TARGET_AREA": 120000,              # 環繞時要保持的目標面積（同FORWARD）
     "AREA_TOLERANCE": 15000,             # 面積容忍度
     "KP_FORWARD": 0.0006,                # 前進控制系數
+    "MAX_EXECUTION_TIME": 30,             # 最長執行時間
 }
 
 # ===================== QR掃描參數 =====================
 QR_SCAN_CONFIG = {
-    "TARGET_AREA": 250000,              # 靠近的目標面積
-    "AREA_TOLERANCE": 20000,
+    "TARGET_AREA": 20000,              # 靠近的目標面積
+    "AREA_TOLERANCE": 10000,
     "KP_YAW": 0.25,
     "KP_UPDOWN": 0.25,
     "KP_FORWARD": 0.0006,                # 提高前進係數，確保能持續靠近
     "MAX_SPEED": 15,
     "DEADZONE": 15,
-    "TARGET_LOST_TIMEOUT": 2,
-    "MAX_SCAN_TIME": 30,                  # 最長掃描時間
+    "TARGET_LOST_TIMEOUT": 5,
+    "MAX_EXECUTION_TIME": 30,             # ⭐ 加入最長執行時間
     "QR_SCAN_INTERVAL": 0.3,
     "FORWARD_WHEN_NO_DECODE": True,       # 無法解碼時前進
-    "MIN_AREA_BEFORE_DECODE": 100000,      # 開始嘗試解碼的最小面積
+    "MIN_AREA_BEFORE_DECODE": 20000,      # 開始嘗試解碼的最小面積
     "CSV_FILE": "scanned_codes.csv"
 }
 
@@ -320,16 +321,15 @@ class ForwardTracker(TargetTracker):
 class CircleScanner(TargetTracker):
     """環繞目標，同時偵測條碼，並保持固定距離"""
     def __init__(self):
-        super().__init__("../model/box2.pt", FORWARD_CONFIG)
+        # 使用 CIRCLE_CONFIG 作為配置
+        super().__init__("../model/box2.pt", CIRCLE_CONFIG)
         self.qr_model = YOLO("../model/barcode1.pt")
         self.scanned_set = set()  # 用於記錄已掃描的條碼
         self.orbit_direction = 1
         self.smooth_center = deque(maxlen=3)
-        self.qr_detected_this_session = False  # 本次環繞是否已偵測到條碼
 
     def start(self):
         super().start()
-        self.qr_detected_this_session = False
         self.smooth_center.clear()
         print("🔄 開始環繞掃描模式")
 
@@ -388,11 +388,8 @@ class CircleScanner(TargetTracker):
                     FORWARD_CONFIG["MAX_SPEED"]
                 )
 
-            # 偵測QR Code（如果還沒掃到）
-            if not self.qr_detected_this_session:
-                qr_detected, qr_bbox = self.detect_qr_code(frame, bbox)
-                if qr_detected:
-                    self.qr_detected_this_session = True
+            # 偵測QR Code
+            qr_detected, qr_bbox = self.detect_qr_code(frame, bbox)
 
         return left_right, forward, up_down, yaw, bbox, qr_detected, qr_bbox
 
@@ -415,7 +412,7 @@ class CircleScanner(TargetTracker):
             return False, None
 
         # 使用YOLO偵測條碼
-        results = self.qr_model(roi, conf=0.5, verbose=False)
+        results = self.qr_model(roi, conf=0.7, verbose=False)
 
         if results[0].boxes is not None and len(results[0].boxes) > 0:
             # 取最大的條碼框
@@ -452,11 +449,13 @@ class CircleScanner(TargetTracker):
 class QRScanner(TargetTracker):
     """專門鎖定並掃描QR Code，無法解碼時持續前進"""
     def __init__(self):
+        # 使用 QR_SCAN_CONFIG 作為配置
         super().__init__("../model/barcode1.pt", QR_SCAN_CONFIG)
         self.scanned_set = set()
         self.scan_count = 0
         self.last_scan_time = 0
         self.scan_complete = False
+        self.qr_lost_time = None
         self.scanned_data = None
         self.consecutive_failures = 0  # 連續解碼失敗次數
         self.csv_file = QR_SCAN_CONFIG["CSV_FILE"]
@@ -472,6 +471,7 @@ class QRScanner(TargetTracker):
         super().start()
         self.scan_complete = False
         self.scanned_data = None
+        self.qr_lost_time = None
         self.last_scan_time = 0
         self.consecutive_failures = 0
         if qr_bbox:
@@ -488,13 +488,14 @@ class QRScanner(TargetTracker):
     def process_frame(self, frame):
         """處理QR Code追蹤和掃描"""
         # 偵測QR Code
-        detected, cx, cy, area, bbox = self.detect_target(frame, conf=0.5)
+        detected, cx, cy, area, bbox = self.detect_target(frame, conf=0.7)
 
         qr_decoded = False
         decoded_data = None
 
         if detected:
             # 計算控制指令
+            self.qr_lost_time = None
             lr, fb, ud, yaw = self.calculate_control(cx, cy, area, self.config["TARGET_AREA"])
 
             # ⭐ 重要：即使還沒解碼，也要持續前進（如果開啟此選項）
@@ -540,6 +541,10 @@ class QRScanner(TargetTracker):
 
             return lr, fb, ud, yaw, bbox, area, reached, qr_decoded, decoded_data
         else:
+            if self.qr_lost_time is None:
+                self.qr_lost_time = time.time()
+                print(f"⚠️ QR目標丟失，等待恢復...")
+
             return 0, 0, 0, 0, None, 0, False, False, None
 
     def decode_qr_code(self, frame, qr_bbox):
@@ -583,7 +588,26 @@ class QRScanner(TargetTracker):
 
     def is_complete(self):
         """檢查掃描是否完成"""
-        return self.scan_complete or super().is_timeout()
+        # ⭐ 修正：掃描完成或超時
+        if self.scan_complete:
+            return True
+        if self.start_time is not None:
+            elapsed = time.time() - self.start_time
+            if elapsed > self.config["MAX_EXECUTION_TIME"]:
+                print(f"⏰ QR掃描超時 ({elapsed:.0f}秒)")
+                return True
+        return False
+
+    def should_abort(self):
+        if self.scan_complete:
+            return False
+
+        if self.qr_lost_time is not None:
+            lost_duration = time.time() - self.qr_lost_time
+            if lost_duration > self.config["TARGET_LOST_TIMEOUT"]:
+                return True
+
+        return False
 
 # ===================== 主控制器 =====================
 class TelloMissionController:
@@ -842,7 +866,7 @@ class TelloMissionController:
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
                         # 掃描完成返回巡航
-                        if self.qr_scanner.is_complete():
+                        if self.qr_scanner.is_complete() or self.qr_scanner.should_abort():
                             if self.qr_scanner.scan_complete:
                                 print(f"✅ QR掃描完成！返回巡航")
                             else:
