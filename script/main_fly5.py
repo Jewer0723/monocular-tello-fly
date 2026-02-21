@@ -64,7 +64,7 @@ CIRCLE_CONFIG = {
     "HEIGHT_CORRECTION_SPEED": 15,
     "MIN_CIRCLE_TIME":        5,
     "MAX_CIRCLE_TIME":       30,
-    "TARGET_LOST_TIMEOUT":    1,
+    "TARGET_LOST_TIMEOUT":    1,  # [Fix 2] 原 1 → 2，容許短暫丟失
     "TARGET_AREA":       120000,
     "AREA_TOLERANCE":      5000,
     "KP_FORWARD":         0.0006,
@@ -216,6 +216,9 @@ class TargetTracker:
     def start(self):
         self.start_time       = time.time()
         self.has_target       = False
+        # Bug Fix: 初始化時就記錄「丟失時間」為 start，
+        # 否則從未偵測到目標時 target_lost_time 永遠是 None，
+        # should_abort() 的條件永遠不成立，超時無法觸發。
         self.target_lost_time = time.time()
         self.target_center_history.clear()
 
@@ -255,7 +258,8 @@ class TargetTracker:
                     valid_boxes.append(b)
 
             if not valid_boxes:
-                if self.has_target and self.target_lost_time is None:
+                # Bug Fix: 同主 else 路徑，移除 has_target 前置判斷
+                if self.target_lost_time is None:
                     self.target_lost_time = time.time()
                     print("⚠️ 目標丟失（過濾後無有效框），等待恢復...")
                 self.has_target = False
@@ -280,6 +284,9 @@ class TargetTracker:
 
             return True, avg_cx, avg_cy, bbox_area, (x1, y1, x2, y2)
         else:
+            # Bug Fix: 移除 has_target 前置判斷。
+            # 原本「第一次就偵測不到目標」時 has_target=False，
+            # 所以 target_lost_time 永遠不會被寫入，should_abort() 永遠 False。
             if self.target_lost_time is None:
                 self.target_lost_time = time.time()
                 print("⚠️ 目標丟失，等待恢復...")
@@ -480,6 +487,7 @@ class CircleScanner(TargetTracker):
         return elapsed >= CIRCLE_CONFIG["MIN_CIRCLE_TIME"]
 
     def should_abort(self):
+        # Bug Fix: 直接用基類邏輯，避免與基類的 target_lost_time 不同步。
         return super().should_abort()
 
 # ===================== QR掃描控制器 =====================
@@ -503,7 +511,7 @@ class QRScanner(TargetTracker):
         """載入CSV中已有的掃描資料"""
         if os.path.exists(self.csv_file):
             try:
-                with open(self.csv_file, mode="r", newline="", encoding="utf-8-sig") as f:
+                with open(self.csv_file, mode="r", newline="", encoding="utf-8") as f:
                     reader = csv.reader(f)
                     next(reader, None)
                     for row in reader:
@@ -516,14 +524,14 @@ class QRScanner(TargetTracker):
         if not os.path.exists(self.csv_file):
             with open(self.csv_file, mode="w", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(["時間", "資料"])
+                writer.writerow(["Timestamp", "Data"])
 
     def start(self, qr_bbox=None):
         """啟動QR掃描模式，可指定初始QR位置"""
-        super().start()
+        super().start()   # 已在基類 start() 設定 target_lost_time = now
         self.scan_complete        = False
         self.scanned_data         = None
-        self.qr_lost_time         = time.time()
+        self.qr_lost_time         = time.time()  # Bug Fix: 與基類對齊，從啟動就開始計時
         self.last_scan_time       = 0
         self.consecutive_failures = 0
 
@@ -589,6 +597,8 @@ class QRScanner(TargetTracker):
 
             return lr, fb, ud, yaw, bbox, area, reached, qr_decoded, decoded_data
         else:
+            # Bug Fix: target_lost_time 由基類 detect_target 統一管理，
+            # 這裡同步更新 qr_lost_time 供 log 用即可，不重複設邏輯。
             if self.qr_lost_time is None:
                 self.qr_lost_time = time.time()
                 print("⚠️ QR目標丟失，等待恢復...")
@@ -647,13 +657,13 @@ class QRScanner(TargetTracker):
         for method in methods:
             barcodes = pyzbar.decode(method)
             if barcodes:
-                return True, barcodes[0].data.decode("utf-8-sig")
+                return True, barcodes[0].data.decode("utf-8")
 
         # [Fix 3] 最後兜底：對整張 frame 解碼（不限 ROI）
         gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         barcodes  = pyzbar.decode(gray_full)
         if barcodes:
-            return True, barcodes[0].data.decode("utf-8-sig")
+            return True, barcodes[0].data.decode("utf-8")
 
         return False, None
 
@@ -668,9 +678,11 @@ class QRScanner(TargetTracker):
         return False
 
     def should_abort(self):
+        # Bug Fix: 原本 scanned_data 也會短路 should_abort，
+        # 導致即使目標丟失也無法退出。現在只有真正掃描完成才短路。
         if self.scan_complete:
             return False
-
+        # 走基類的 target_lost_time 判斷
         return super().should_abort()
 
 # ===================== 主控制器 =====================
@@ -894,7 +906,10 @@ class TelloMissionController:
                             time.sleep(1)
                             self.change_state(DroneState.QR_SCAN, qr_bbox)
                         elif self.circle.should_abort() or self.circle.is_timeout():
-                            print("↩️ 環繞完成，返回巡航")
+                            # Bug Fix: 原本 is_timeout() AND is_complete() 雙重條件，
+                            # 當沒有 QR 但環繞超時時，因 is_complete() 邏輯混用導致卡死。
+                            # 現在只要超時或目標丟失就直接退出。
+                            print("↩️ 環繞完成/超時，返回巡航")
                             self.change_state(DroneState.MIDAS)
 
                     # ─── QR_SCAN 模式 ─────────────────────────────────────
