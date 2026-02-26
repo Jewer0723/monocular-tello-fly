@@ -21,7 +21,7 @@ DEADZONE = 20
 # =======================
 # 初始化 YOLO
 # =======================
-model = YOLO("../model/logistics.pt")
+model = YOLO("../model/box2.pt")
 
 # =======================
 # 初始化 Tello
@@ -65,7 +65,7 @@ while True:
 
     # ========= 自動追蹤模式 =========
     else:
-        results = model(frame, conf=0.6, verbose=False)
+        results = model(frame, conf=0.65, verbose=False)
 
         if results[0].boxes is not None and len(results[0].boxes) > 0:
             boxes = results[0].boxes

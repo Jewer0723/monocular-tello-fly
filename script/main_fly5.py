@@ -24,6 +24,8 @@ from datetime import datetime
 # ===================== 全局配置 =====================
 FRAME_W, FRAME_H = 640, 480
 CONTROL_INTERVAL = 0.05          # [Fix 2] 原 0.1 → 0.05，提高控制頻率
+box_conf = 0.7
+qr_conf = 0.7
 
 # ===================== 狀態定義 =====================
 class DroneState:
@@ -40,7 +42,7 @@ MIDAS_CONFIG = {
     "CLEAR_THRESHOLD":   0.25,
     "TURN_DURATION":     1.5,
     "SMOOTHING_WINDOW":  5,
-    "TARGET_FOUND_AREA": 30000,
+    "TARGET_FOUND_AREA": 10000,
 }
 
 # ===================== 前進追蹤參數 =====================
@@ -52,14 +54,14 @@ FORWARD_CONFIG = {
     "KP_FORWARD":         0.0006,
     "MAX_SPEED":          20,
     "DEADZONE":           20,
-    "MIN_AREA":           30000,
+    "MIN_AREA":           10000,
     "TARGET_LOST_TIMEOUT": 1,
     "MAX_EXECUTION_TIME":  30,
 }
 
 # ===================== 環繞掃描參數 =====================
 CIRCLE_CONFIG = {
-    "ORBIT_SPEED":           6,   # [Fix 2] 原 7 → 5，降低環繞速度
+    "ORBIT_SPEED":           7,   # [Fix 2] 原 7 → 5，降低環繞速度
     "YAW_CORRECTION_SPEED": 25,   # [Fix 2] 原 15 → 25，提高 yaw 修正上限
     "HEIGHT_CORRECTION_SPEED": 15,
     "MIN_CIRCLE_TIME":        5,
@@ -244,7 +246,7 @@ class TargetTracker:
             return False
         return True
 
-    def detect_target(self, frame, conf=0.7):  # [Fix 1] conf 預設提高至 0.75
+    def detect_target(self, frame, conf=box_conf):  # [Fix 1] conf 預設提高至 0.75
         results = self.model(frame, conf=conf, verbose=False)
 
         if results[0].boxes is not None and len(results[0].boxes) > 0:
@@ -461,7 +463,7 @@ class CircleScanner(TargetTracker):
         if roi.size == 0:
             return False, None
 
-        results = self.qr_model(roi, conf=0.7, verbose=False)
+        results = self.qr_model(roi, conf=qr_conf, verbose=False)
 
         if results[0].boxes is not None and len(results[0].boxes) > 0:
             boxes    = results[0].boxes
@@ -524,7 +526,7 @@ class QRScanner(TargetTracker):
         if not os.path.exists(self.csv_file):
             with open(self.csv_file, mode="w", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Timestamp", "Data"])
+                writer.writerow(["時間", "資料"])
 
     def start(self, qr_bbox=None):
         """啟動QR掃描模式，可指定初始QR位置"""
@@ -548,7 +550,7 @@ class QRScanner(TargetTracker):
 
     def process_frame(self, frame):
         """處理QR Code追蹤和掃描"""
-        detected, cx, cy, area, bbox = self.detect_target(frame, conf=0.7)
+        detected, cx, cy, area, bbox = self.detect_target(frame, conf=box_conf)
 
         qr_decoded   = False
         decoded_data = None
@@ -571,7 +573,11 @@ class QRScanner(TargetTracker):
                 if decoded:
                     if data in self.scanned_set:
                         print(f"⚠️ 條碼已掃描過: {data}，立即返回巡航")
-                        self.scan_complete        = True
+                        self.scan_count += 1
+                        self.scanned_data = data
+                        self.scan_complete = True
+                        qr_decoded = True
+                        decoded_data = data
                         self.consecutive_failures = 0
                     else:
                         self.scanned_set.add(data)
@@ -824,7 +830,7 @@ class TelloMissionController:
                         cv2.imshow("Depth Map", depth_display)
 
                         # [Fix 1] conf 提高至 0.75
-                        results = self.forward.model(frame, conf=0.7, verbose=False)
+                        results = self.forward.model(frame, conf=box_conf, verbose=False)
                         if results[0].boxes is not None and len(results[0].boxes) > 0:
                             boxes = results[0].boxes
 
@@ -944,12 +950,13 @@ class TelloMissionController:
                                     print(f"↩️ 條碼已掃描過: {data}，返回巡航")
                                 else:
                                     print("✅ QR掃描完成！返回巡航")
+
+                                self.tello.send_rc_control(0, 0, 50, 0)
+                                time.sleep(1)
+                                self.change_state(DroneState.MIDAS)
                             else:
                                 print("⏰ QR掃描超時，返回巡航")
-
-                            self.tello.send_rc_control(0, 0, 30, 0)
-                            time.sleep(1)
-                            self.change_state(DroneState.MIDAS)
+                                self.change_state(DroneState.MIDAS)
 
                     current_time = time.time()
                     if current_time - last_control_time >= CONTROL_INTERVAL:
