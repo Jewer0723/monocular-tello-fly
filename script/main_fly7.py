@@ -1,5 +1,5 @@
 """
-Tello 四階段任務控制系統（優化版 v3）
+Tello 四階段任務控制系統（優化版 v5）
 狀態機: MIDAS → FORWARD → CIRCLE → QR_SCAN → MIDAS
 
 修改紀錄：
@@ -7,6 +7,8 @@ Tello 四階段任務控制系統（優化版 v3）
   [Fix 2] 環繞 yaw 跟不上：降低環繞速度、提高 yaw 修正上限、移除 yaw 縮小係數、縮短控制間隔
   [Fix 3] 條碼掃不到：ROI 強制放大、加銳化/OTSU 預處理、TARGET_AREA 增大、對全帧兜底解碼
   [v3]   新增飛行軌跡紀錄器（航位推算）、低電量自動回航降落、MiDaS 偽點雲即時顯示
+  [v5]   回航改為 ArUco 視覺導引降落（前視搜尋→接近→切下視精確對準→降落）
+         放棄不可靠的位置估算，純視覺回航
 """
 
 import torch
@@ -32,6 +34,18 @@ except ImportError:
     OPEN3D_AVAILABLE = False
     print("⚠️  open3d 未安裝，點雲視窗將關閉。安裝：pip install open3d")
 
+# cv2.aruco 檢查（opencv-contrib-python 才有）
+try:
+    _aruco_test = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_50)
+    ARUCO_AVAILABLE = True
+except AttributeError:
+    try:
+        _aruco_test = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        ARUCO_AVAILABLE = True
+    except Exception:
+        ARUCO_AVAILABLE = False
+        print("⚠️  cv2.aruco 不可用。安裝：pip install opencv-contrib-python")
+
 # ===================== 全局配置 =====================
 FRAME_W, FRAME_H = 640, 480
 CONTROL_INTERVAL = 0.05          # [Fix 2] 原 0.1 → 0.05，提高控制頻率
@@ -40,11 +54,12 @@ qr_conf = 0.7
 
 # ===================== 狀態定義 =====================
 class DroneState:
-    MIDAS       = "MIDAS"        # 巡航避障模式
-    FORWARD     = "FORWARD"      # 前進接近目標模式
-    CIRCLE      = "CIRCLE"       # 環繞掃描模式（偵測條碼）
-    QR_SCAN     = "QR_SCAN"      # QR Code掃描模式（鎖定靠近）
-    RETURN_HOME = "RETURN_HOME"  # [v3] 低電量自動回航
+    MIDAS          = "MIDAS"           # 巡航避障模式
+    FORWARD        = "FORWARD"         # 前進接近目標模式
+    CIRCLE         = "CIRCLE"          # 環繞掃描模式（偵測條碼）
+    QR_SCAN        = "QR_SCAN"         # QR Code掃描模式（鎖定靠近）
+    RETURN_HOME    = "RETURN_HOME"     # 低電量回航（MiDaS避障+ArUco搜尋）
+    ARUCO_LANDING  = "ARUCO_LANDING"   # [v5] ArUco 視覺精確降落
 
 # ===================== MidAS 巡航參數 =====================
 MIDAS_CONFIG = {
@@ -102,14 +117,44 @@ QR_SCAN_CONFIG = {
     "CSV_FILE":              "scanned_codes.csv"
 }
 
+# ===================== [v4] 氣壓定高參數 =====================
+ALTITUDE_CONFIG = {
+    "ENABLED":       True,  # False 可暫時關閉
+    "KP":             0.6,  # 高度誤差比例係數（基於 cm 單位）
+    "MAX_UD":          20,  # 最大垂直修正速度
+    "DEADZONE":         8,  # 誤差死區(cm)，8cm 內不修正避免震盪
+    "UPDATE_MANUAL": True,  # 手動操控時是否跟著更新目標高度
+}
+
 # ===================== [v3] 低電量回航參數 =====================
 LOW_BATTERY_CONFIG = {
-    "THRESHOLD":          50,   # 低於此電量(%)觸發回航
+    "THRESHOLD":          20,   # 低於此電量(%)觸發回航
     "CHECK_INTERVAL":   5,     # 每幾秒查一次電量
     "RETURN_SPEED":       20,   # 回航飛行速度
     "YAW_KP":            0.8,   # 偏航修正係數
     "WAYPOINT_RADIUS":    60,   # 中繼航點到達容忍半徑(cm)
     "LAND_RADIUS":        20,   # 起飛點降落容忍半徑(cm)
+}
+
+# ===================== [v5] ArUco 降落參數 =====================
+ARUCO_CONFIG = {
+    "MARKER_ID":          0,      # 地板放置的 ArUco 標記 ID（可自訂）
+    "DICT":    cv2.aruco.DICT_4X4_50,  # 字典類型，對應印出的標記
+    "MARKER_SIZE_CM":    20.0,    # 實際標記邊長(cm)，用於估算距離
+    # 前視搜尋階段
+    "SEARCH_YAW_SPEED":  20,      # 搜尋時旋轉速度
+    "SEARCH_FB_SPEED":   15,      # 搜尋時緩慢前進速度
+    "APPROACH_SPEED":    12,      # 接近標記的前進速度
+    "DESCENT_SPEED":     10,      # 靠近過程中緩降速度（負=下降）
+    "KP_YAW":           0.15,     # 水平對準 yaw 係數（小一點防震盪）
+    "KP_LR":            0.08,     # 水平對準左右係數
+    "KP_FB":            0.06,     # 前後對準係數
+    "DEADZONE_PX":       25,      # 像素死區（中心偏差小於此不修正）
+    # 切換下視的條件
+    "SWITCH_DOWN_AREA": 18000,    # 標記在前視畫面中的面積達此值切下視
+    # 下視精對準階段
+    "LAND_AREA":        25000,    # 下視標記面積達此值 → 降落
+    "MAX_SEARCH_TIME":     40,    # 搜尋超時(秒)後強制降落
 }
 
 # ===================== [v3] 偽點雲參數（MiDaS 反投影）=====================
@@ -145,8 +190,8 @@ class FlightTracker:
         self.last_time = time.time()
         self.home      = (0.0, 0.0, 0.0)   # 起飛點
 
-    def update(self, tello: "Tello"):
-        """每幀呼叫一次，從感測器讀值更新位置"""
+    def update(self, tello: "Tello", is_manual: bool = False):
+        """每幀呼叫一次，從感測器讀值更新位置。is_manual=True 標記手動段。"""
         now = time.time()
         dt  = now - self.last_time
         self.last_time = now
@@ -177,7 +222,7 @@ class FlightTracker:
         self.y += world_vy * dt
         self.z += world_vz * dt
 
-        self.path.append((self.x, self.y, self.z))
+        self.path.append((self.x, self.y, self.z, is_manual))
 
     def get_yaw_to_point(self, tx: float, tz: float) -> float:
         """
@@ -254,11 +299,13 @@ class FlightTracker:
             return (int(cx_map + (px - ox) * scale),
                     int(cy_map - (pz - oz) * scale))
 
-        # 畫軌跡
+        # 畫軌跡（自動段=水藍, 手動段=橘）
         for i in range(1, len(self.path)):
             p1 = to_px(self.path[i-1][0], self.path[i-1][2])
             p2 = to_px(self.path[i][0],   self.path[i][2])
-            cv2.line(frame, p1, p2, (0, 200, 255), 1)
+            is_man = len(self.path[i]) > 3 and self.path[i][3]
+            color  = (0, 140, 255) if is_man else (0, 200, 255)
+            cv2.line(frame, p1, p2, color, 1)
 
         # 起飛點（綠圓）
         hp = to_px(self.home[0], self.home[2])
@@ -1056,6 +1103,186 @@ class QRScanner(TargetTracker):
         # 走基類的 target_lost_time 判斷
         return super().should_abort()
 
+
+# ===================== [v5] ArUco 視覺降落控制器 =====================
+class ArucoLandingController:
+    """
+    兩階段 ArUco 降落：
+    Phase 1 (前視)：MiDaS 避障漫遊同時搜尋地板 ArUco 標記
+                    偵測到後對準水平中心並緩降
+    Phase 2 (下視)：高度夠低後切換下視鏡頭，精確對準後降落
+
+    相容新舊兩版 cv2.aruco API（opencv 4.7 前後不同）
+    """
+
+    def __init__(self):
+        self.phase          = 1        # 1=前視搜尋  2=下視精對準
+        self.start_time     = None
+        self.last_seen_time = None
+        self.camera_down    = False
+
+        # 初始化 ArUco 字典與偵測器（相容新舊 API）
+        dict_id = ARUCO_CONFIG["DICT"]
+        try:
+            self.aruco_dict   = cv2.aruco.getPredefinedDictionary(dict_id)
+            self.aruco_params = cv2.aruco.DetectorParameters()
+            self.detector     = cv2.aruco.ArucoDetector(
+                self.aruco_dict, self.aruco_params)
+            self._new_api = True
+        except AttributeError:
+            self.aruco_dict   = cv2.aruco.Dictionary_get(dict_id)
+            self.aruco_params = cv2.aruco.DetectorParameters_create()
+            self._new_api     = False
+
+    def start(self):
+        self.phase          = 1
+        self.start_time     = time.time()
+        self.last_seen_time = None
+        self.camera_down    = False
+        print("🎯 ArUco 降落控制器啟動（Phase 1 前視搜尋）")
+
+    def detect(self, frame):
+        """偵測 ArUco 標記，回傳 (corners, ids) 或 (None, None)"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        try:
+            if self._new_api:
+                corners, ids, _ = self.detector.detectMarkers(gray)
+            else:
+                corners, ids, _ = cv2.aruco.detectMarkers(
+                    gray, self.aruco_dict, parameters=self.aruco_params)
+        except Exception:
+            return None, None
+
+        if ids is None:
+            return None, None
+
+        # 只取目標 ID
+        target_id = ARUCO_CONFIG["MARKER_ID"]
+        for i, mid in enumerate(ids.flatten()):
+            if mid == target_id:
+                return corners[i], mid
+        return None, None
+
+    def _marker_center_and_area(self, corners):
+        """從 corners 計算中心像素座標與面積"""
+        pts = corners[0]
+        cx  = int(pts[:, 0].mean())
+        cy  = int(pts[:, 1].mean())
+        # 用叉積算面積
+        def cross(a, b, c):
+            return abs((b[0]-a[0])*(c[1]-a[1]) - (c[0]-a[0])*(b[1]-a[1]))
+        area = 0.5 * (cross(pts[0], pts[1], pts[2]) +
+                      cross(pts[0], pts[2], pts[3]))
+        return cx, cy, area
+
+    def draw(self, frame, corners, mid):
+        """在畫面上繪製偵測結果"""
+        if corners is None:
+            return frame
+        try:
+            if self._new_api:
+                cv2.aruco.drawDetectedMarkers(frame, [corners], np.array([[mid]]))
+            else:
+                cv2.aruco.drawDetectedMarkers(frame, [corners], np.array([[mid]]))
+        except Exception:
+            pass
+        return frame
+
+    def process(self, frame, tello):
+        """
+        主處理函式，每幀呼叫一次。
+        回傳 (control_cmd, phase, landed, draw_frame)
+        control_cmd = [lr, fb, ud, yaw]
+        landed = True 時代表已呼叫 tello.land()
+        """
+        cfg     = ARUCO_CONFIG
+        corners, mid = self.detect(frame)
+        elapsed = time.time() - self.start_time
+        landed  = False
+
+        lr = fb = ud = yaw = 0
+
+        # ── 超時保護 ──
+        if elapsed > cfg["MAX_SEARCH_TIME"]:
+            print(f"⏰ ArUco 搜尋超時({elapsed:.0f}s)，強制降落")
+            tello.send_rc_control(0, 0, 0, 0)
+            time.sleep(0.3)
+            tello.land()
+            landed = True
+            return [0,0,0,0], self.phase, landed, frame
+
+        if corners is not None:
+            self.last_seen_time = time.time()
+            cx, cy, area = self._marker_center_and_area(corners)
+            frame = self.draw(frame, corners, mid)
+
+            err_x = cx - FRAME_W // 2   # 正=右
+            err_y = cy - FRAME_H // 2   # 正=下（前視時代表標記在下方）
+            dz    = cfg["DEADZONE_PX"]
+
+            if self.phase == 1:
+                # ── Phase 1：前視對準 + 緩降 ──
+                if abs(err_x) > dz:
+                    yaw = int(cfg["KP_YAW"] * err_x)
+                    yaw = max(-30, min(30, yaw))
+                if abs(err_x) < dz * 3:   # 方向大致對了才前進
+                    fb  = cfg["APPROACH_SPEED"]
+                ud = -cfg["DESCENT_SPEED"]  # 邊靠近邊緩降
+
+                # 面積夠大 → 切下視
+                if area >= cfg["SWITCH_DOWN_AREA"] and not self.camera_down:
+                    print(f"📷 標記面積={area:.0f}，切換下視鏡頭")
+                    try:
+                        tello.set_video_direction(Tello.CAMERA_DOWNWARD)
+                        self.camera_down = True
+                        self.phase = 2
+                        time.sleep(0.5)
+                    except Exception as e:
+                        print(f"⚠️ 切換下視失敗: {e}，繼續前視模式")
+
+            else:
+                # ── Phase 2：下視精對準 ──
+                # 下視中：cx,cy 偏差對應 lr, fb 修正
+                if abs(err_x) > dz:
+                    lr = int(cfg["KP_LR"] * err_x)
+                    lr = max(-20, min(20, lr))
+                if abs(err_y) > dz:
+                    fb = int(cfg["KP_FB"] * err_y)
+                    fb = max(-15, min(15, fb))
+
+                ud = -cfg["DESCENT_SPEED"]  # 持續緩降
+
+                # 面積夠大且對準 → 降落
+                if (area >= cfg["LAND_AREA"]
+                        and abs(err_x) < dz * 2
+                        and abs(err_y) < dz * 2):
+                    print(f"✅ ArUco 精確對準（面積={area:.0f}），降落！")
+                    tello.send_rc_control(0, 0, 0, 0)
+                    time.sleep(0.3)
+                    tello.land()
+                    landed = True
+                    return [0,0,0,0], self.phase, landed, frame
+
+            # HUD
+            cv2.putText(frame,
+                        f"ArUco Phase{self.phase}  area:{area:.0f}  "
+                        f"err:({err_x},{err_y})",
+                        (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (0, 255, 255), 1)
+        else:
+            # 沒看到標記 → 緩慢旋轉搜尋
+            if self.phase == 1:
+                yaw = cfg["SEARCH_YAW_SPEED"]
+                fb  = cfg["SEARCH_FB_SPEED"]
+            else:
+                # 下視丟失標記 → 原地等待
+                yaw = cfg["SEARCH_YAW_SPEED"] // 2
+            cv2.putText(frame, "ArUco: SEARCHING...", (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+
+        return [lr, fb, ud, yaw], self.phase, landed, frame
+
+
 # ===================== 主控制器 =====================
 class TelloMissionController:
     def __init__(self):
@@ -1074,6 +1301,9 @@ class TelloMissionController:
         # [v3] 飛行軌跡紀錄器
         self.tracker = FlightTracker()
 
+        # [v5] ArUco 降落控制器
+        self.aruco_lander = ArucoLandingController() if ARUCO_AVAILABLE else None
+
         # [v3] 偽點雲視窗
         self.pcl_vis = PointCloudVisualizer(self.tracker)
         self.pcl_vis.start()
@@ -1081,6 +1311,10 @@ class TelloMissionController:
         # [v3] 電量監控
         self._last_battery_check = 0.0
         self._low_battery_triggered = False
+
+        # [v4] 目標高度鎖定（使用 get_height()，單位 cm）
+        self._target_alt  = None   # 鎖定的目標高度
+        self._alt_active  = False  # 起飛後啟動
 
         self.current_state  = DroneState.MIDAS
         self.state_start_time = time.time()
@@ -1137,11 +1371,14 @@ class TelloMissionController:
             self.circle.start()
         elif new_state == DroneState.QR_SCAN:
             self.qr_scanner.start(qr_bbox)
-        elif new_state == DroneState.RETURN_HOME:     # [v3]
-            # 建立沿原軌跡的回航航點（抽樣間距 80cm）
-            self._return_waypoints = self.tracker.build_return_waypoints(80)
-            self._return_wp_idx    = 0
-            print(f"🏠 啟動回航：共 {len(self._return_waypoints)} 個航點")
+        elif new_state == DroneState.RETURN_HOME:
+            print("🏠 啟動回航（MiDaS避障 + ArUco搜尋）")
+        elif new_state == DroneState.ARUCO_LANDING:   # [v5]
+            if self.aruco_lander:
+                self.aruco_lander.start()
+            else:
+                print("⚠️ ArUco 不可用，直接降落")
+                self.tello.land()
 
         print(f"\n🔄 狀態切換: {old_state} → {new_state}")
 
@@ -1193,15 +1430,15 @@ class TelloMissionController:
 
                 frame = cv2.resize(frame, (FRAME_W, FRAME_H))
 
-                # [v3] 更新軌跡位置（每幀）
-                self.tracker.update(self.tello)
-
                 # [v3] 低電量檢查（週期性）
                 self._check_battery()
 
                 (manual_active, lr, fb, ud, yv,
                  quit_flag, force_state,
                  takeoff_cmd, land_cmd) = self.get_keyboard_control()
+
+                # [v3] 更新軌跡（手動段標記橘色）
+                self.tracker.update(self.tello, is_manual=manual_active)
 
                 if quit_flag:
                     print("使用者中斷程式")
@@ -1211,6 +1448,14 @@ class TelloMissionController:
                     print("🛸 手動起飛")
                     self.tello.takeoff()
                     time.sleep(1)
+                    time.sleep(1.5)   # 等起飛穩定
+                    try:
+                        self._target_alt = float(self.tello.get_height())
+                        self._alt_active = True
+                        self.tracker.reset()
+                        print(f"📏 目標高度鎖定: {self._target_alt:.0f}cm")
+                    except Exception:
+                        pass
 
                 if land_cmd:
                     print("🛬 手動降落")
@@ -1219,6 +1464,25 @@ class TelloMissionController:
 
                 if force_state:
                     self.change_state(force_state)
+
+                # 手動時若有上下輸入，延遲更新目標高度（讓人先飛到新高度）
+                if (manual_active and self._alt_active
+                        and ALTITUDE_CONFIG["UPDATE_MANUAL"] and ud != 0):
+                    try:
+                        # 等 0.5s 後讀取，避免讀到中間過渡值
+                        # 這裡用旗標方式：ud 持續為 0 才讀取（在控制輸出後更新）
+                        self._pending_alt_update = True
+                    except Exception:
+                        pass
+                elif (self._alt_active and not manual_active
+                      and getattr(self, "_pending_alt_update", False)):
+                    # 鬆開上下鍵後更新目標高度
+                    try:
+                        self._target_alt = float(self.tello.get_height())
+                        self._pending_alt_update = False
+                        print(f"📏 目標高度更新: {self._target_alt:.0f}cm")
+                    except Exception:
+                        pass
 
                 if not manual_active:
                     control_cmd = [0, 0, 0, 0]
@@ -1369,70 +1633,90 @@ class TelloMissionController:
                                 print("⏰ QR掃描超時，返回巡航")
                                 self.change_state(DroneState.MIDAS)
 
-                    # ─── RETURN_HOME 模式 [v3] ────────────────────────────
+                    # ─── RETURN_HOME 模式 [v5] ────────────────────────────
+                    # MiDaS 避障漫遊，同時用前視鏡頭搜尋地板 ArUco 標記
+                    # 偵測到標記後立即切換 ARUCO_LANDING 精確降落
                     elif self.current_state == DroneState.RETURN_HOME:
                         spd = LOW_BATTERY_CONFIG["RETURN_SPEED"]
-                        kp  = LOW_BATTERY_CONFIG["YAW_KP"]
-                        wps = self._return_waypoints
-                        idx = self._return_wp_idx
 
-                        if idx >= len(wps):
-                            # 所有航點飛完 → 降落
-                            print("🏠 到達起飛點！自動降落")
-                            self.tello.send_rc_control(0, 0, 0, 0)
-                            time.sleep(0.5)
-                            self.tello.land()
-                            self.tracker.save_path_csv()
-                            break
-
-                        # 目前目標航點
-                        wp_x, wp_z = wps[idx]
-                        dx  = wp_x - self.tracker.x
-                        dz  = wp_z - self.tracker.z
-                        wp_dist   = math.sqrt(dx**2 + dz**2)
-                        home_dist = self.tracker.distance_to_home()
-
-                        # 最後一個航點用嚴格半徑降落，中繼點用寬鬆半徑
-                        is_last_wp = (idx == len(wps) - 1)
-                        arrive_r   = (LOW_BATTERY_CONFIG["LAND_RADIUS"] if is_last_wp
-                                      else LOW_BATTERY_CONFIG["WAYPOINT_RADIUS"])
-
-                        if wp_dist < arrive_r:
-                            if is_last_wp:
-                                print(f"🏠 到達起飛點（距離 {wp_dist:.0f}cm）！自動降落")
+                        # ArUco 搜尋（前視）
+                        if self.aruco_lander:
+                            corners, mid = self.aruco_lander.detect(frame)
+                            if corners is not None:
+                                print("🎯 回航中偵測到 ArUco 標記！切換精確降落")
                                 self.tello.send_rc_control(0, 0, 0, 0)
-                                time.sleep(0.5)
-                                self.tello.land()
-                                self.tracker.save_path_csv()
-                                break
-                            else:
-                                self._return_wp_idx += 1
-                                print(f"📍 航點 {idx+1}/{len(wps)} 到達，繼續下一點")
+                                time.sleep(0.3)
+                                self.change_state(DroneState.ARUCO_LANDING)
                                 control_cmd = [0, 0, 0, 0]
-                        else:
-                            # 計算指向當前航點的偏航誤差（已修正符號系）
-                            yaw_err = self.tracker.get_yaw_to_point(wp_x, wp_z)
-                            yaw_cmd = int(kp * yaw_err)
-                            yaw_cmd = max(-40, min(40, yaw_cmd))
-                            if abs(yaw_err) < 15:
-                                fb_cmd = spd   # 方向對齊後前進
+                                # HUD
+                                cv2.putText(frame, "ArUco FOUND! Switching...",
+                                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.7, (0, 255, 0), 2)
+                                # skip 後面的 MiDaS 邏輯
+                                cv2.putText(frame, "MODE: RETURN HOME", (10, 30),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                            (0, 100, 255), 2)
+                                # 直接跳到 control_cmd 發送
+                                goto_control = True
                             else:
-                                fb_cmd = 0     # 先原地轉向
+                                goto_control = False
+                        else:
+                            goto_control = False
+
+                        if not goto_control:
+                            # MiDaS 避障漫遊
+                            _, ret_depth = self.midas.process_frame(frame)
+                            obstacle_ahead = ret_depth > MIDAS_CONFIG["OBSTACLE_THRESHOLD"]
+
+                            if obstacle_ahead:
+                                fb_cmd  = 0
+                                yaw_cmd = MIDAS_CONFIG["TURN_SPEED"]
+                                cv2.putText(frame, "OBSTACLE - TURNING",
+                                            (10, 100), cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.6, (0, 0, 255), 2)
+                            else:
+                                fb_cmd  = spd
+                                yaw_cmd = 0
+
                             control_cmd = [0, fb_cmd, 0, yaw_cmd]
 
-                        # HUD
-                        cv2.putText(frame, "MODE: RETURN HOME", (10, 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 100, 255), 2)
-                        cv2.putText(frame,
-                                    f"WP {idx+1}/{len(wps)}  dist:{wp_dist:.0f}cm"                                    f"  HOME:{home_dist:.0f}cm",
-                                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                    (255, 255, 255), 1)
-                        if idx < len(wps):
-                            yaw_err_disp = self.tracker.get_yaw_to_point(
-                                wps[idx][0], wps[idx][1])
-                            cv2.putText(frame, f"YawErr:{yaw_err_disp:.1f}°",
-                                        (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            # HUD
+                            cv2.putText(frame, "MODE: RETURN HOME", (10, 30),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                        (0, 100, 255), 2)
+                            cv2.putText(frame,
+                                        f"Searching ArUco...  Depth:{ret_depth:.2f}",
+                                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                                         (200, 200, 200), 1)
+
+                    # ─── ARUCO_LANDING 模式 [v5] ──────────────────────────
+                    elif self.current_state == DroneState.ARUCO_LANDING:
+                        if self.aruco_lander:
+                            ctrl, phase, landed, frame = \
+                                self.aruco_lander.process(frame, self.tello)
+                            control_cmd = ctrl
+                            if landed:
+                                self.tracker.save_path_csv()
+                                break
+                        cv2.putText(frame, f"MODE: ARUCO LANDING (Ph{phase})",
+                                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.7, (0, 255, 128), 2)
+
+                    # [v4] 氣壓定高修正
+                    # [v4] 目標高度補正（僅在自動模式且 ud 沒被其他邏輯佔用時）
+                    if (self._alt_active and self._target_alt is not None
+                            and ALTITUDE_CONFIG["ENABLED"]
+                            and control_cmd[2] == 0):
+                        try:
+                            cur_alt  = float(self.tello.get_height())
+                            alt_err  = self._target_alt - cur_alt
+                            if abs(alt_err) > ALTITUDE_CONFIG["DEADZONE"]:
+                                ud_corr = int(ALTITUDE_CONFIG["KP"] * alt_err)
+                                ud_corr = max(-ALTITUDE_CONFIG["MAX_UD"],
+                                              min(ALTITUDE_CONFIG["MAX_UD"], ud_corr))
+                                control_cmd[2] = ud_corr
+                        except Exception:
+                            pass
 
                     current_time = time.time()
                     if current_time - last_control_time >= CONTROL_INTERVAL:
