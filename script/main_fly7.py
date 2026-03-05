@@ -40,6 +40,8 @@ FRAME_W, FRAME_H = 640, 480
 CONTROL_INTERVAL = 0.05          # [Fix 2] 原 0.1 → 0.05，提高控制頻率
 box_conf = 0.7
 qr_conf = 0.7
+box_model_path = "../model/box2.pt"
+barcode_model_path = "../model/barcode1.pt"
 
 # ===================== 狀態定義 =====================
 class DroneState:
@@ -759,7 +761,7 @@ class TargetTracker:
 # ===================== 前進追蹤控制器 =====================
 class ForwardTracker(TargetTracker):
     def __init__(self):
-        super().__init__("../model/box2.pt", FORWARD_CONFIG)
+        super().__init__(box_model_path, FORWARD_CONFIG)
 
     def process_frame(self, frame):
         detected, cx, cy, area, bbox = self.detect_target(frame)
@@ -776,8 +778,8 @@ class CircleScanner(TargetTracker):
     """環繞目標，同時偵測條碼，並保持固定距離"""
 
     def __init__(self):
-        super().__init__("../model/box2.pt", CIRCLE_CONFIG)
-        self.qr_model        = YOLO("../model/barcode1.pt")
+        super().__init__(box_model_path, CIRCLE_CONFIG)
+        self.qr_model        = YOLO(barcode_model_path)
         self.scanned_set     = set()
         self.orbit_direction = 1
         self.smooth_center   = deque(maxlen=3)
@@ -901,7 +903,7 @@ class QRScanner(TargetTracker):
     """專門鎖定並掃描QR Code，無法解碼時持續前進"""
 
     def __init__(self):
-        super().__init__("../model/barcode1.pt", QR_SCAN_CONFIG)
+        super().__init__(barcode_model_path, QR_SCAN_CONFIG)
         self.scanned_set          = set()
         self.scan_count           = 0
         self.last_scan_time       = 0
