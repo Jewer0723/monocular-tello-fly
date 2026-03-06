@@ -49,11 +49,14 @@ class DroneState:
     FORWARD        = "FORWARD"         # 前進接近目標模式
     CIRCLE         = "CIRCLE"          # 環繞掃描模式（偵測條碼）
     QR_SCAN        = "QR_SCAN"         # QR Code掃描模式（鎖定靠近）
-    RETURN_HOME    = "RETURN_HOME"     # [v8] 前視ORB地標搜尋+MiDaS避障
-    VISUAL_LANDING = "VISUAL_LANDING"  # [v8] 切換下視，ORB比對確認降落
 
 # ===================== MidAS 巡航參數 =====================
 MIDAS_CONFIG = {
+    # 隨機高度變化（MIDAS 巡航時使用）
+    "ALT_CHANGE_INTERVAL": 3.0,
+    "ALT_SPEED":            12,
+    "ALT_MIN_CM":           50,
+    "ALT_MAX_CM":          180,
     "BASE_FORWARD":      20,
     "TURN_SPEED":        40,
     "OBSTACLE_THRESHOLD": 0.35,
@@ -108,14 +111,6 @@ QR_SCAN_CONFIG = {
     "CSV_FILE":              "scanned_codes.csv"
 }
 
-# ===================== [v4] 氣壓定高參數 =====================
-ALTITUDE_CONFIG = {
-    "ENABLED":       True,  # False 可暫時關閉
-    "KP":             0.6,  # 高度誤差比例係數（基於 cm 單位）
-    "MAX_UD":          20,  # 最大垂直修正速度
-    "DEADZONE":         8,  # 誤差死區(cm)，8cm 內不修正避免震盪
-    "UPDATE_MANUAL": True,  # 手動操控時是否跟著更新目標高度
-}
 
 # ===================== [v3] 低電量回航參數 =====================
 LOW_BATTERY_CONFIG = {
@@ -127,29 +122,6 @@ LOW_BATTERY_CONFIG = {
     "LAND_RADIUS":        20,   # 起飛點降落容忍半徑(cm)
 }
 
-# ===================== [v8] 視覺地標回航參數 =====================
-VISUAL_HOME_CONFIG = {
-    # ORB 特徵比對
-    "ORB_FEATURES":       500,   # ORB 最大特徵點數
-    "LOWE_RATIO":        0.75,   # Lowe ratio test 閾值
-    # 前視階段（持續，不切換）
-    "SCAN_INTERVAL":      0.4,   # 前視 ORB 掃描間隔(秒)，避免每幀跑太重
-    "REGIONS":       ["left","center","right"],  # 左/中/右三區塊
-    "APPROACH_THRESH":     20,   # 某區塊 match ≥ 此值 → 朝該方向靠近，停止避障
-    "SWITCH_THRESH":       45,   # 前視 match ≥ 此值 AND 估算面積夠大 → 切下視
-    "APPROACH_SPEED":      15,   # 朝地標前進速度
-    "YAW_L":              -22,   # 地標在左側時的偏航指令
-    "YAW_R":               22,   # 地標在右側時的偏航指令
-    "BBOX_AREA_SWITCH":  8000,   # 匹配點包圍框面積(px²) ≥ 此值才允許切下視
-    # 下視階段（切換後不再回前視）
-    "LAND_THRESH":         50,   # 下視 match ≥ 此值視為到達起飛點
-    "LAND_CONFIRM":         3,   # 連續幾幀滿足才降落
-    "DESCENT_SPEED":        8,   # 下視緩降速度
-    "KP_LR":             0.06,   # 下視左右對準係數
-    "KP_FB":             0.06,   # 下視前後對準係數（用匹配點重心偏移）
-    "MAX_SPEED_DWN":       12,   # 下視對準最大速度
-    "MAX_SEARCH_TIME":    120,   # 總超時(秒)後強制降落
-}
 
 # ===================== [v3] 偽點雲參數（MiDaS 反投影）=====================
 POINTCLOUD_CONFIG = {
@@ -164,6 +136,55 @@ POINTCLOUD_CONFIG = {
     "DEPTH_SCALE":      3.0,   # 相對深度縮放倍率（調整視覺密度感）
 }
 
+
+# ===================== [v9] RViz UDP 橋接發布器 =====================
+class RvizBridge:
+    """
+    把 FlightTracker 位置以 JSON over UDP 發送給 bridge_node.py。
+    bridge_node.py 跑在 WSL1 ROS 環境裡，負責轉發到 ROS topic。
+
+    如果 bridge_node.py 沒有啟動，這個類別會靜默失敗，不影響主程式。
+
+    發布頻率：每幀最多 10Hz（避免 UDP 過頻）
+    封包格式：JSON {"x":float,"y":float,"z":float,"yaw":float,"home":[x,z]}
+    """
+    def __init__(self, host: str = "127.0.0.1", port: int = 9999):
+        import socket, json as _json
+        self._json   = _json
+        self._sock   = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._addr   = (host, port)
+        self._last_t = 0.0
+        self._ok     = True
+        print(f"📡 RvizBridge 初始化 → UDP {host}:{port}")
+
+    def send(self, tracker):
+        """每幀呼叫，內部 限速 10Hz"""
+        if not self._ok:
+            return
+        now = time.time()
+        if now - self._last_t < 0.1:   # 10Hz 限速
+            return
+        self._last_t = now
+        try:
+            payload = self._json.dumps({
+                "x":   round(tracker.x,   1),
+                "y":   round(tracker.y,   1),
+                "z":   round(tracker.z,   1),
+                "yaw": round(tracker.yaw, 1),
+                "home": [tracker.home[0], tracker.home[2]],
+                "path_len": len(tracker.path),
+            }).encode()
+            self._sock.sendto(payload, self._addr)
+        except Exception:
+            pass   # bridge 沒開時靜默失敗
+
+    def close(self):
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
 # ===================== [v3] 飛行軌跡紀錄器（航位推算 Dead Reckoning）=====================
 class FlightTracker:
     """
@@ -176,13 +197,24 @@ class FlightTracker:
         self.reset()
 
     def reset(self):
-        self.x   = 0.0   # 右方累積位移 (cm)
-        self.y   = 0.0   # 高度累積位移 (cm)
-        self.z   = 0.0   # 前方累積位移 (cm)
-        self.yaw = 0.0   # 目前偏航角 (度，逆時針為正)
-        self.path: list[tuple] = [(0.0, 0.0, 0.0)]   # 軌跡列表 (x, z) 俯視
+        """完整重設，含起飛點（僅程式第一次 __init__ 時用）"""
+        self.x   = 0.0
+        self.y   = 0.0
+        self.z   = 0.0
+        self.yaw = 0.0
+        self.path: list[tuple] = [(0.0, 0.0, 0.0, False)]
         self.last_time = time.time()
-        self.home      = (0.0, 0.0, 0.0)   # 起飛點
+        self.home      = (0.0, 0.0, 0.0)   # 起飛點（固定，不再被覆寫）
+
+    def reset_pose(self):
+        """起飛後呼叫：只清位移/軌跡，保留 home 不動"""
+        self.x   = 0.0
+        self.y   = 0.0
+        self.z   = 0.0
+        self.yaw = 0.0
+        self.path = [(0.0, 0.0, 0.0, False)]
+        self.last_time = time.time()
+        # self.home 不動 → 起飛點永遠是 (0,0,0)
 
     def update(self, tello: "Tello", is_manual: bool = False):
         """每幀呼叫一次，從感測器讀值更新位置。is_manual=True 標記手動段。"""
@@ -1098,225 +1130,6 @@ class QRScanner(TargetTracker):
         return super().should_abort()
 
 
-# ===================== [v8] 視覺地標回航控制器（ORB 特徵比對）=====================
-class VisualHomingController:
-    """
-    流程：
-    ① 起飛後切下視拍參考照，提取 ORB 特徵 → 切回前視
-    ② RETURN_HOME：前視持續運行，每 SCAN_INTERVAL 秒掃描左/中/右三區塊
-       - 無匹配：MiDaS 避障漫遊
-       - 某區塊 match ≥ APPROACH_THRESH：停 MiDaS，朝該方向飛
-       - match ≥ SWITCH_THRESH 且包圍框夠大：切下視，進入 VISUAL_LANDING
-    ③ VISUAL_LANDING：只用下視，ORB 比對 + 對準中心 + 緩降
-       連續 LAND_CONFIRM 幀滿足 → land()
-    """
-    # 區塊定義（x 起點比例, x 終點比例）
-    REGION_BOUNDS = {"left": (0.0, 0.4), "center": (0.3, 0.7), "right": (0.6, 1.0)}
-
-    def __init__(self):
-        cfg = VISUAL_HOME_CONFIG
-        self.orb = cv2.ORB_create(cfg["ORB_FEATURES"])
-        self.bf  = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-        self.ref_des  = None
-        self.ref_kp   = None
-        self.start_time      = None
-        self.last_scan_time  = 0.0
-        self.last_region_result = {"left": 0, "center": 0, "right": 0}
-        self.land_confirm_cnt   = 0
-
-    # ─────────────────────────────────────────────
-    # 公用工具
-    # ─────────────────────────────────────────────
-    def capture_reference(self, frame):
-        """傳入下視幀，提取 ORB 特徵存為參考"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        kp, des = self.orb.detectAndCompute(gray, None)
-        if des is None or len(kp) < 10:
-            print("⚠️ 參考照片特徵點不足（地板太平滑？）")
-            return False
-        self.ref_kp  = kp
-        self.ref_des = des
-        vis = cv2.drawKeypoints(gray, kp, None,
-                                flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-        cv2.imwrite("home_reference.png", vis)
-        print(f"✅ 參考照片擷取完成（{len(kp)} 個特徵點），存為 home_reference.png")
-        return True
-
-    def is_ready(self):
-        return self.ref_des is not None
-
-    def _match(self, gray):
-        """回傳有效匹配點列表（已做 Lowe ratio test）"""
-        if self.ref_des is None:
-            return []
-        kp, des = self.orb.detectAndCompute(gray, None)
-        if des is None or len(des) < 5:
-            return []
-        try:
-            raw = self.bf.knnMatch(self.ref_des, des, k=2)
-        except Exception:
-            return []
-        ratio = VISUAL_HOME_CONFIG["LOWE_RATIO"]
-        good  = [m for mn in raw if len(mn)==2
-                 for m, n in [mn] if m.distance < ratio * n.distance]
-        return good
-
-    def _match_region(self, gray, region):
-        """比對畫面中某區塊，回傳 (match數, 包圍框面積px²)"""
-        h, w   = gray.shape
-        x0, x1 = self.REGION_BOUNDS[region]
-        crop   = gray[:, int(w*x0):int(w*x1)]
-        good   = self._match(crop)
-        if len(good) == 0:
-            return 0, 0
-        # 匹配點在 crop 裡的位置
-        kp_q, _ = self.orb.detectAndCompute(crop, None)
-        if not kp_q:
-            return len(good), 0
-        pts = np.array([kp_q[m.queryIdx].pt for m in good
-                        if m.queryIdx < len(kp_q)], dtype=np.float32)
-        if len(pts) < 4:
-            return len(good), 0
-        rx, ry, rw, rh = cv2.boundingRect(pts.reshape(-1,1,2).astype(np.int32))
-        return len(good), rw * rh
-
-    def start(self):
-        self.start_time          = time.time()
-        self.last_scan_time      = 0.0
-        self.last_region_result  = {"left": 0, "center": 0, "right": 0}
-        self.land_confirm_cnt    = 0
-        print("🏠 視覺地標回航啟動（前視 ORB 持續掃描）")
-
-    @staticmethod
-    def switch_cam(tello, direction):
-        try:
-            tello.set_video_direction(direction)
-            time.sleep(0.4)
-        except Exception as e:
-            print(f"⚠️ 切換鏡頭失敗: {e}")
-
-    # ─────────────────────────────────────────────
-    # 前視處理（RETURN_HOME 每幀呼叫）
-    # ─────────────────────────────────────────────
-    def process_fwd(self, frame):
-        """
-        回傳 (action, best_region, match_cnt, bbox_area, disp_frame)
-        action: "search" | "approach" | "switch_down"
-        """
-        cfg  = VISUAL_HOME_CONFIG
-        disp = frame.copy()
-        h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        now  = time.time()
-
-        # 限速掃描
-        if now - self.last_scan_time >= cfg["SCAN_INTERVAL"]:
-            self.last_scan_time = now
-            for reg in ["left", "center", "right"]:
-                cnt, area = self._match_region(gray, reg)
-                self.last_region_result[reg] = (cnt, area)
-
-        # 找最佳區塊
-        best_reg  = max(self.last_region_result,
-                        key=lambda r: self.last_region_result[r][0])
-        best_cnt, best_area = self.last_region_result[best_reg]
-
-        # 決定 action
-        if best_cnt >= cfg["SWITCH_THRESH"] and best_area >= cfg["BBOX_AREA_SWITCH"]:
-            action = "switch_down"
-        elif best_cnt >= cfg["APPROACH_THRESH"]:
-            action = "approach"
-        else:
-            action = "search"
-
-        # ── HUD 三區塊指示條 ──
-        bar_colors = {"left": (255,100,0), "center": (0,200,255), "right": (0,100,255)}
-        positions  = {"left": 10, "center": w//2-60, "right": w-130}
-        for reg, (cnt, area) in self.last_region_result.items():
-            bx = positions[reg]
-            bw = min(cnt * 3, 120)
-            active = (reg == best_reg and action != "search")
-            col = (0, 255, 0) if active else bar_colors[reg]
-            cv2.rectangle(disp, (bx, h-45), (bx+bw, h-30), col, -1)
-            cv2.putText(disp, f"{reg}:{cnt}", (bx, h-50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1)
-
-        # 狀態文字
-        status_txt = {"search": "SEARCHING...", "approach": f"→ {best_reg.upper()}",
-                      "switch_down": f"LOCK! → DOWN CAM"}
-        status_col = {"search": (200,200,200), "approach": (0,200,255),
-                      "switch_down": (0,255,0)}
-        cv2.putText(disp, status_txt[action], (10, 65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_col[action], 2)
-
-        return action, best_reg, best_cnt, best_area, disp
-
-    # ─────────────────────────────────────────────
-    # 下視處理（VISUAL_LANDING 每幀呼叫）
-    # ─────────────────────────────────────────────
-    def process_dwn(self, frame, tello):
-        """
-        回傳 (control_cmd, landed, disp_frame)
-        對準畫面中心 + 緩降；連續 LAND_CONFIRM 幀 match ≥ LAND_THRESH → land()
-        """
-        cfg  = VISUAL_HOME_CONFIG
-        disp = frame.copy()
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        h, w = frame.shape[:2]
-        lr = fb = yaw = 0
-        ud = -cfg["DESCENT_SPEED"]
-        landed = False
-
-        good = self._match(gray)
-        cnt  = len(good)
-
-        if cnt >= cfg["LAND_THRESH"]:
-            self.land_confirm_cnt += 1
-        else:
-            self.land_confirm_cnt = max(0, self.land_confirm_cnt - 1)
-
-        # 用匹配點重心估算偏移，對準中心
-        if cnt > 5:
-            kp_cur, _ = self.orb.detectAndCompute(gray, None)
-            valid_pts  = [kp_cur[m.trainIdx].pt for m in good
-                          if m.trainIdx < len(kp_cur)]
-            if valid_pts:
-                cx = np.mean([p[0] for p in valid_pts])
-                cy = np.mean([p[1] for p in valid_pts])
-                err_x = cx - w//2
-                err_y = cy - h//2
-                spd   = cfg["MAX_SPEED_DWN"]
-                if abs(err_x) > 20:
-                    lr = int(np.clip(cfg["KP_LR"] * err_x, -spd, spd))
-                if abs(err_y) > 20:
-                    fb = int(np.clip(cfg["KP_FB"] * err_y, -spd, spd))
-                cv2.circle(disp, (int(cx), int(cy)), 8, (0,255,0), -1)
-                cv2.line(disp, (w//2, h//2), (int(cx), int(cy)), (0,255,255), 2)
-
-        # 特徵點視覺化
-        kp_vis, _ = self.orb.detectAndCompute(gray, None)
-        disp = cv2.drawKeypoints(disp, kp_vis, None, color=(0,165,255),
-                                 flags=cv2.DRAW_MATCHES_FLAGS_DEFAULT)
-
-        # HUD
-        bar_w = min(cnt * 4, w - 20)
-        col   = (0,255,0) if cnt >= cfg["LAND_THRESH"] else (0,165,255)
-        cv2.rectangle(disp, (10, h-45), (10+bar_w, h-30), col, -1)
-        cv2.putText(disp,
-                    f"ORB:{cnt}  confirm:{self.land_confirm_cnt}/{cfg['LAND_CONFIRM']}",
-                    (10, h-50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
-        cv2.putText(disp, "DOWN CAM - VISUAL LANDING",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,128), 1)
-
-        if self.land_confirm_cnt >= cfg["LAND_CONFIRM"]:
-            print(f"✅ 視覺確認到達起飛點（ORB={cnt}），降落！")
-            tello.send_rc_control(0,0,0,0)
-            time.sleep(0.3)
-            tello.land()
-            landed = True
-
-        return [lr, fb, ud, yaw], landed, disp
-
 
 # ===================== 主控制器 =====================
 class TelloMissionController:
@@ -1336,9 +1149,12 @@ class TelloMissionController:
         # [v3] 飛行軌跡紀錄器
         self.tracker = FlightTracker()
 
-        # [v7] 視覺地標回航控制器
-        self.visual_homing = VisualHomingController()
-        self._ref_captured = False   # 是否已擷取參考照片
+        # [v9] RViz UDP 橋接（選用，bridge_node.py 不開時靜默）
+        self.rviz_bridge = RvizBridge()
+
+        # [v9] 隨機高度控制
+        self._alt_next_time = float("inf")  # 起飛前不觸發
+        self._alt_ud_cmd    = 0              # 目前高度指令（+上/-下/0 靜止）
 
         # [v3] 偽點雲視窗
         self.pcl_vis = PointCloudVisualizer(self.tracker)
@@ -1348,9 +1164,6 @@ class TelloMissionController:
         self._last_battery_check = 0.0
         self._low_battery_triggered = False
 
-        # [v4] 目標高度鎖定（使用 get_height()，單位 cm）
-        self._target_alt  = None   # 鎖定的目標高度
-        self._alt_active  = False  # 起飛後啟動
 
         self.current_state  = DroneState.MIDAS
         self.state_start_time = time.time()
@@ -1407,18 +1220,35 @@ class TelloMissionController:
             self.circle.start()
         elif new_state == DroneState.QR_SCAN:
             self.qr_scanner.start(qr_bbox)
-        elif new_state == DroneState.RETURN_HOME:
-            self.midas.state = "FORWARD"
-            self.visual_homing.start()
-            # 交替切換計時器
-            self._cam_switch_time = time.time()
-            self._cam_is_down     = False
-            print("🏠 啟動視覺地標回航（前視MiDaS避障 + ORB特徵比對）")
-        elif new_state == DroneState.VISUAL_LANDING:  # [v8]
-            print("📷 切換下視，進入視覺精確降落模式")
-            VisualHomingController.switch_cam(self.tello, Tello.CAMERA_DOWNWARD)
 
         print(f"\n🔄 狀態切換: {old_state} → {new_state}")
+
+    def _get_random_alt_cmd(self) -> int:
+        """
+        MIDAS 巡航時每 ALT_CHANGE_INTERVAL 秒隨機決定高度指令。
+        讀取 get_height() 確保不超出上下限。
+        回傳 ud 值（正=上升，負=下降，0=靜止）
+        """
+        cfg = MIDAS_CONFIG
+        now = time.time()
+        if now >= self._alt_next_time:
+            self._alt_next_time = now + cfg["ALT_CHANGE_INTERVAL"]
+            try:
+                h = float(self.tello.get_height())
+            except Exception:
+                h = 100.0   # 讀不到時假設中間高度
+            if h <= cfg["ALT_MIN_CM"]:
+                self._alt_ud_cmd = cfg["ALT_SPEED"]    # 太低，強制上升
+            elif h >= cfg["ALT_MAX_CM"]:
+                self._alt_ud_cmd = -cfg["ALT_SPEED"]   # 太高，強制下降
+            else:
+                # 隨機：上升/靜止/下降 各 1/3 機率
+                import random
+                choice = random.randint(0, 2)
+                self._alt_ud_cmd = (
+                    cfg["ALT_SPEED"]  if choice == 0 else
+                    -cfg["ALT_SPEED"] if choice == 1 else 0)
+        return self._alt_ud_cmd
 
     def _check_battery(self):
         """[v3] 週期性電量檢查，低電量時切換回航"""
@@ -1434,10 +1264,8 @@ class TelloMissionController:
 
         if bat <= LOW_BATTERY_CONFIG["THRESHOLD"] and not self._low_battery_triggered:
             self._low_battery_triggered = True
-            print(f"🔋 低電量警告！電量={bat}%，強制回航")
+            print(f"🔋 低電量警告！電量={bat}%，請手動降落（L 鍵）")
             self.tello.send_rc_control(0, 0, 0, 0)
-            time.sleep(0.3)
-            self.change_state(DroneState.RETURN_HOME)
 
     def run(self):
         print("\n" + "="*50)
@@ -1478,6 +1306,9 @@ class TelloMissionController:
                 # [v3] 更新軌跡（手動段標記橘色）
                 self.tracker.update(self.tello, is_manual=manual_active)
 
+                # [v9] 發送位置到 RViz bridge
+                self.rviz_bridge.send(self.tracker)
+
                 if quit_flag:
                     print("使用者中斷程式")
                     break
@@ -1487,54 +1318,25 @@ class TelloMissionController:
                     self.tello.takeoff()
                     time.sleep(1)
                     time.sleep(1.5)   # 等起飛穩定
-                    try:
-                        self._target_alt = float(self.tello.get_height())
-                        self._alt_active = True
-                        self.tracker.reset()
-                        print(f"📏 目標高度鎖定: {self._target_alt:.0f}cm")
-                    except Exception:
-                        pass
-                    # [v7] 切下視拍參考照 → 切回前視
-                    if not self._ref_captured:
-                        print("📷 切換下視擷取地標參考照...")
-                        VisualHomingController.switch_cam(
-                            self.tello, Tello.CAMERA_DOWNWARD)
-                        time.sleep(0.6)   # 等串流穩定
-                        ref_frame = frame_reader.frame
-                        if ref_frame is not None:
-                            ref_frame = cv2.resize(ref_frame, (FRAME_W, FRAME_H))
-                            ok = self.visual_homing.capture_reference(ref_frame)
-                            self._ref_captured = ok
-                        VisualHomingController.switch_cam(
-                            self.tello, Tello.CAMERA_FORWARD)
-                        print("📷 已切回前視，任務開始")
+                    self.tracker.reset_pose()   # 重設位移/軌跡，起飛點固定不動
+                    # 起飛穩定後 5 秒才開始隨機高度變化
+                    self._alt_next_time = time.time() + 5.0
+                    self._alt_ud_cmd    = 0
+                    print("📍 起飛點固定：(0, 0, 0)，開始軌跡記錄")
 
                 if land_cmd:
                     print("🛬 手動降落")
+                    # 停止隨機高度，避免 ud 指令干擾降落
+                    self._alt_ud_cmd    = 0
+                    self._alt_next_time = float("inf")
+                    self.tello.send_rc_control(0, 0, 0, 0)
+                    time.sleep(0.3)
                     self.tello.land()
                     time.sleep(1)
 
                 if force_state:
                     self.change_state(force_state)
 
-                # 手動時若有上下輸入，延遲更新目標高度（讓人先飛到新高度）
-                if (manual_active and self._alt_active
-                        and ALTITUDE_CONFIG["UPDATE_MANUAL"] and ud != 0):
-                    try:
-                        # 等 0.5s 後讀取，避免讀到中間過渡值
-                        # 這裡用旗標方式：ud 持續為 0 才讀取（在控制輸出後更新）
-                        self._pending_alt_update = True
-                    except Exception:
-                        pass
-                elif (self._alt_active and not manual_active
-                      and getattr(self, "_pending_alt_update", False)):
-                    # 鬆開上下鍵後更新目標高度
-                    try:
-                        self._target_alt = float(self.tello.get_height())
-                        self._pending_alt_update = False
-                        print(f"📏 目標高度更新: {self._target_alt:.0f}cm")
-                    except Exception:
-                        pass
 
                 if not manual_active:
                     control_cmd = [0, 0, 0, 0]
@@ -1543,7 +1345,9 @@ class TelloMissionController:
                     if self.current_state == DroneState.MIDAS:
                         depth_norm, center_depth = self.midas.process_frame(frame)
                         fbv, yv = self.midas.get_control(center_depth, time.time())
-                        control_cmd = [0, fbv, 0, yv]
+                        # 隨機高度
+                        ud_midas = self._get_random_alt_cmd()
+                        control_cmd = [0, fbv, ud_midas, yv]
 
                         depth_display = cv2.applyColorMap(
                             (depth_norm * 255).astype(np.uint8),
@@ -1685,85 +1489,6 @@ class TelloMissionController:
                                 print("⏰ QR掃描超時，返回巡航")
                                 self.change_state(DroneState.MIDAS)
 
-                    # ─── RETURN_HOME 模式 [v8] ────────────────────────────
-                    # 前視持續，三區塊 ORB 比對 + MiDaS 避障
-                    # 看到地標：停 MiDaS，朝地標方向飛
-                    # 地標夠近（包圍框大）：切下視 → VISUAL_LANDING
-                    elif self.current_state == DroneState.RETURN_HOME:
-                        cfg_vh = VISUAL_HOME_CONFIG
-                        spd    = LOW_BATTERY_CONFIG["RETURN_SPEED"]
-
-                        # 超時保護
-                        if time.time() - self.visual_homing.start_time > cfg_vh["MAX_SEARCH_TIME"]:
-                            print("⏰ 視覺回航超時，強制降落")
-                            self.tello.send_rc_control(0,0,0,0)
-                            time.sleep(0.3)
-                            self.tello.land()
-                            self.tracker.save_path_csv()
-                            break
-
-                        action, best_reg, match_cnt, bbox_area, fwd_disp =                             self.visual_homing.process_fwd(frame)
-
-                        if action == "switch_down":
-                            # ── 切換下視 ──
-                            print(f"🎯 地標鎖定（ORB={match_cnt} area={bbox_area}），切換下視")
-                            self.tello.send_rc_control(0,0,0,0)
-                            time.sleep(0.2)
-                            self.change_state(DroneState.VISUAL_LANDING)
-                            control_cmd = [0,0,0,0]
-
-                        elif action == "approach":
-                            # ── 朝地標方向靠近（停止 MiDaS）──
-                            yaw_cmd = (cfg_vh["YAW_R"] if best_reg == "right" else
-                                       cfg_vh["YAW_L"] if best_reg == "left"  else 0)
-                            control_cmd = [0, spd, 0, yaw_cmd]
-                            cv2.putText(fwd_disp, "LANDMARK → APPROACH",
-                                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.7, (0,200,255), 2)
-
-                        else:
-                            # ── 搜尋：MiDaS 避障漫遊 ──
-                            depth_norm, center_depth = self.midas.process_frame(frame)
-                            fbv, midas_yv = self.midas.get_control(center_depth, time.time())
-                            control_cmd = [0, fbv, 0, midas_yv]
-
-                            depth_disp = cv2.applyColorMap(
-                                (depth_norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
-                            cv2.imshow("Depth Map", depth_disp)
-
-                            fwd_disp = self.midas.draw_overlay(
-                                fwd_disp, center_depth, fbv, midas_yv)
-                            cv2.putText(fwd_disp, "MODE: RETURN HOME  SEARCHING",
-                                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.7, (0,100,255), 2)
-
-                        frame = fwd_disp
-
-                    # ─── VISUAL_LANDING 模式 [v8] ─────────────────────────
-                    # 下視持續，ORB 比對 + 對準中心 + 緩降 → 降落
-                    elif self.current_state == DroneState.VISUAL_LANDING:
-                        ctrl, landed, dwn_disp =                             self.visual_homing.process_dwn(frame, self.tello)
-                        control_cmd = ctrl
-                        if landed:
-                            self.tracker.save_path_csv()
-                            break
-                        frame = dwn_disp
-
-                    # [v4] 氣壓定高修正
-                    # [v4] 目標高度補正（僅在自動模式且 ud 沒被其他邏輯佔用時）
-                    if (self._alt_active and self._target_alt is not None
-                            and ALTITUDE_CONFIG["ENABLED"]
-                            and control_cmd[2] == 0):
-                        try:
-                            cur_alt  = float(self.tello.get_height())
-                            alt_err  = self._target_alt - cur_alt
-                            if abs(alt_err) > ALTITUDE_CONFIG["DEADZONE"]:
-                                ud_corr = int(ALTITUDE_CONFIG["KP"] * alt_err)
-                                ud_corr = max(-ALTITUDE_CONFIG["MAX_UD"],
-                                              min(ALTITUDE_CONFIG["MAX_UD"], ud_corr))
-                                control_cmd[2] = ud_corr
-                        except Exception:
-                            pass
 
                     current_time = time.time()
                     if current_time - last_control_time >= CONTROL_INTERVAL:
@@ -1788,9 +1513,7 @@ class TelloMissionController:
                             (10, FRAME_H-30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-                # 下視期間由 RETURN_HOME 自行管理視窗，跳過主視窗更新
-                if not locals().get("skip_main_imshow", False):
-                    cv2.imshow("Tello Mission Control", frame)
+                cv2.imshow("Tello Mission Control", frame)
 
                 if cv2.waitKey(1) == 27:
                     break
@@ -1805,6 +1528,7 @@ class TelloMissionController:
 
     def cleanup(self):
         print("\n🧹 清理資源中...")
+        self.rviz_bridge.close()
         self.tello.send_rc_control(0, 0, 0, 0)
         time.sleep(0.5)
         print("⚠️  請記得手動降落")
@@ -1812,11 +1536,6 @@ class TelloMissionController:
         # [v3] 儲存軌跡、關閉點雲視窗
         self.tracker.save_path_csv()
         self.pcl_vis.stop()
-        # [v7] 確保鏡頭恢復前視
-        try:
-            VisualHomingController.switch_cam(self.tello, Tello.CAMERA_FORWARD)
-        except Exception:
-            pass
 
         self.tello.streamoff()
         pygame.quit()
