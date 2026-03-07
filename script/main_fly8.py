@@ -12,7 +12,6 @@ Tello 四階段任務控制系統（優化版 v5）
 """
 
 import torch
-import json
 import socket
 import cv2
 import numpy as np
@@ -27,6 +26,7 @@ import os
 import math
 import threading
 from datetime import datetime
+import json
 
 # open3d 為可選依賴，沒安裝時關閉點雲視窗
 try:
@@ -250,9 +250,9 @@ class OrbCorrector:
         try:
             raw, _ = self._rx_sock.recvfrom(4096)
             msg = json.loads(raw.decode())
-        except (BlockingIOError, socket.timeout, OSError):
-            return False
         except Exception:
+            # Catches BlockingIOError, socket.timeout,
+            # and Windows WSAEWOULDBLOCK (errno 10035)
             return False
 
         if msg.get("type") != "orb_pose" or not msg.get("tracking"):
@@ -282,7 +282,13 @@ class OrbCorrector:
         tracker.x = orb_x * self._scale
         tracker.y = orb_y * self._scale
         tracker.z = orb_z * self._scale
+        if not self._active:
+            print(f"[ORB] First correction applied! scale={self._scale:.2f}")
         self._active = True
+        self._corr_count = getattr(self, '_corr_count', 0) + 1
+        if self._corr_count % 50 == 0:
+            print(f"[ORB] Corrections applied: {self._corr_count}  "+
+                  f"pos=({tracker.x:.1f},{tracker.y:.1f},{tracker.z:.1f})cm")
         return True
 
     @property
