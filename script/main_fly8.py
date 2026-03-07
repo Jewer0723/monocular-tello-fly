@@ -12,6 +12,8 @@ Tello 四階段任務控制系統（優化版 v5）
 """
 
 import torch
+import json
+import socket
 import cv2
 import numpy as np
 from djitellopy import Tello
@@ -183,6 +185,118 @@ class RvizBridge:
             self._sock.close()
         except Exception:
             pass
+
+
+# ══════════════════════════════════════════════════════════════
+# OrbCorrector: send frames to WSL1, receive ORB-SLAM3 corrections
+# ══════════════════════════════════════════════════════════════
+class OrbCorrector:
+    """
+    TX: sends JPEG frames to WSL1 :9998 for ORB-SLAM3 input
+    RX: receives corrected pose from WSL1 :9997, applies to FlightTracker
+
+    Scale estimation:
+      ORB monocular has no absolute scale. We use Tello get_height() as
+      vertical reference: scale = tello_height_cm / orb_y (when orb_y != 0).
+      Scale is smoothed with EMA and applied to x/z.
+    """
+    CAM_PORT  = 9998
+    CORR_PORT = 9997
+    JPEG_Q    = 60
+    SEND_HZ   = 15
+
+    def __init__(self, wsl_host: str = "127.0.0.1"):
+        self._tx_sock   = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._tx_addr   = (wsl_host, self.CAM_PORT)
+        self._tx_last_t = 0.0
+
+        self._rx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._rx_sock.bind(("0.0.0.0", self.CORR_PORT))
+        self._rx_sock.settimeout(0.0)  # non-blocking
+
+        self._scale     = None
+        self._scale_ema = 0.1
+        self._active    = False
+        print(f"OrbCorrector: TX->:9998  RX<-:9997")
+
+    def send_frame(self, frame):
+        """
+        Resize to 480x360 before encoding to keep JPEG < 60KB (UDP limit ~65KB).
+        ORB-SLAM3 works well at 480x360; tello_cam_node uses scaled intrinsics.
+        """
+        now = time.time()
+        if now - self._tx_last_t < 1.0 / self.SEND_HZ:
+            return
+        self._tx_last_t = now
+        try:
+            small = cv2.resize(frame, (480, 360))
+            ok, buf = cv2.imencode(".jpg", small,
+                                   [cv2.IMWRITE_JPEG_QUALITY, self.JPEG_Q])
+            if not ok:
+                return
+            data = buf.tobytes()
+            if len(data) > 65000:
+                # Fallback: lower quality if still too large
+                ok, buf = cv2.imencode(".jpg", small,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 40])
+                if not ok:
+                    return
+                data = buf.tobytes()
+            self._tx_sock.sendto(data, self._tx_addr)
+        except Exception:
+            pass
+
+    def poll_correction(self, tracker, tello):
+        try:
+            raw, _ = self._rx_sock.recvfrom(4096)
+            msg = json.loads(raw.decode())
+        except (BlockingIOError, socket.timeout, OSError):
+            return False
+        except Exception:
+            return False
+
+        if msg.get("type") != "orb_pose" or not msg.get("tracking"):
+            return False
+
+        orb_x = msg["x"]
+        orb_y = msg["y"]
+        orb_z = msg["z"]
+
+        try:
+            tello_h = float(tello.get_height())
+        except Exception:
+            tello_h = None
+
+        if tello_h and tello_h > 20 and abs(orb_y) > 0.05:
+            raw_scale = tello_h / abs(orb_y)
+            raw_scale = max(5.0, min(500.0, raw_scale))
+            if self._scale is None:
+                self._scale = raw_scale
+            else:
+                a = self._scale_ema
+                self._scale = a * raw_scale + (1 - a) * self._scale
+
+        if self._scale is None:
+            return False
+
+        tracker.x = orb_x * self._scale
+        tracker.y = orb_y * self._scale
+        tracker.z = orb_z * self._scale
+        self._active = True
+        return True
+
+    @property
+    def active(self):
+        return self._active
+
+    def close(self):
+        try:
+            self._tx_sock.close()
+            self._rx_sock.close()
+        except Exception:
+            pass
+        print("OrbCorrector closed")
+
 
 
 # ===================== [v3] 飛行軌跡紀錄器（航位推算 Dead Reckoning）=====================
@@ -1143,6 +1257,7 @@ class TelloMissionController:
 
         # [v9] RViz UDP 橋接（選用，bridge_node.py 不開時靜默）
         self.rviz_bridge = RvizBridge()
+        self.orb = OrbCorrector()
         self._scanned_popup_until = 0.0  # popup 顯示到此時間戳
 
         # [v9] 隨機高度控制
@@ -1298,6 +1413,9 @@ class TelloMissionController:
 
                 # [v3] 更新軌跡（手動段標記橘色）
                 self.tracker.update(self.tello, is_manual=manual_active)
+                # ORB-SLAM3: send frame to WSL1, apply correction if available
+                self.orb.send_frame(frame)
+                self.orb.poll_correction(self.tracker, self.tello)
 
                 # [v9] 發送位置到 RViz bridge
                 self.rviz_bridge.send(self.tracker)
@@ -1497,6 +1615,10 @@ class TelloMissionController:
                 # [v3] 俯視軌跡小地圖（右上角）
                 frame = self.tracker.draw_minimap(frame)
 
+                orb_txt = "ORB: ON" if self.orb.active else "ORB: INIT"
+                orb_col = (0, 220, 0) if self.orb.active else (0, 165, 255)
+                cv2.putText(frame, orb_txt, (FRAME_W-130, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, orb_col, 2)
                 cv2.putText(frame, f"State: {self.current_state}",
                             (10, FRAME_H-60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -1534,6 +1656,7 @@ class TelloMissionController:
     def cleanup(self):
         print("\n🧹 清理資源中...")
         self.rviz_bridge.close()
+        self.orb.close()
         self.tello.send_rc_control(0, 0, 0, 0)
         time.sleep(0.5)
         print("⚠️  請記得手動降落")

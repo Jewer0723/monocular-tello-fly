@@ -24,16 +24,18 @@ Published topics:
                   id=2  colored axes  drone body XYZ axes
 """
 
-import socket, json, math
+import socket, json, math, struct
 import rospy
 import tf2_ros
 from geometry_msgs.msg import (PoseStamped, Point, TransformStamped,
                                 Vector3, Quaternion)
+from nav_msgs.msg import Odometry
 from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA, Header
 
-UDP_PORT = 9999
+UDP_PORT     = 9999   # Windows → WSL1 位置
+ORB_CORR_PORT = 9997  # WSL1 → Windows ORB 校正位置
 FRAME_ID = "world"
 SCALE    = 1      # cm → m
 MAX_PATH = 8000
@@ -98,15 +100,34 @@ class TelloBridge:
         self.sock.settimeout(1.0)
         rospy.loginfo(f"[bridge] Listening UDP 127.0.0.1:{UDP_PORT}")
 
+        # ORB-SLAM3 correction: subscribe pose, send back to Windows
+        self._orb_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._orb_target = ("127.0.0.1", ORB_CORR_PORT)
+        self._orb_active = False   # True once ORB starts tracking
+        self._orb_last_t = 0.0
+        rospy.Subscriber("/orb_slam3/camera_pose", PoseStamped,
+                          self._orb_pose_cb, queue_size=1)
+        rospy.loginfo("[bridge] Subscribed /orb_slam3/camera_pose")
+
     def _publish_world_frame(self):
-        """Publish map->world identity static TF
-        so rviz TF display does not report unknown frame map error"""
-        st = TransformStamped()
-        st.header.stamp    = rospy.Time.now()
-        st.header.frame_id = "map"
-        st.child_frame_id  = "world"
-        st.transform.rotation.w = 1.0
-        self._static_broadcaster.sendTransform(st)
+        """Publish static TFs: map->world and world->camera (identity)"""
+        now = rospy.Time.now()
+
+        # map -> world
+        st1 = TransformStamped()
+        st1.header.stamp    = now
+        st1.header.frame_id = "map"
+        st1.child_frame_id  = "world"
+        st1.transform.rotation.w = 1.0
+
+        # world -> camera (identity - ORB-SLAM3 needs this to exist)
+        st2 = TransformStamped()
+        st2.header.stamp    = now
+        st2.header.frame_id = "world"
+        st2.child_frame_id  = "camera"
+        st2.transform.rotation.w = 1.0
+
+        self._static_broadcaster.sendTransform([st1, st2])
 
     def _broadcast_drone_tf(self, rx, ry, rz, yaw_deg, now):
         """Publish dynamic TF world -> tello for advanced use"""
@@ -190,6 +211,46 @@ class TelloBridge:
                 f"yaw={d['yaw']:.1f}deg dist_home={dist:.2f}m "
                 f"path={len(self.path_msg.poses)}pts")
 
+    def _orb_pose_cb(self, msg: PoseStamped):
+        """
+        Called when ORB-SLAM3 publishes a new pose.
+        Converts ORB world frame → FlightTracker frame and sends UDP correction.
+
+        ORB-SLAM3 (Monocular) coordinate system:
+          X = right, Y = down, Z = forward  (camera optical frame)
+        FlightTracker frame:
+          X = right(cm), Y = up(cm), Z = forward(cm)
+        Scale: ORB monocular is scale-ambiguous.
+          We use get_height() from Tello as vertical reference to estimate scale.
+          For now we send normalised ORB pose; main_fly7 applies scale.
+        """
+        import time as _time
+        now = _time.time()
+        if now - self._orb_last_t < 0.05:   # max 20 Hz to Windows
+            return
+        self._orb_last_t = now
+
+        p = msg.pose.position
+        # ORB camera frame → FlightTracker (cm)
+        # ORB X→right, Y→down, Z→forward
+        # FlightTracker X→right, Y→up, Z→forward
+        orb_x =  p.x * 100.0   # right (cm)
+        orb_y = -p.y * 100.0   # up    (cm) — flip Y
+        orb_z =  p.z * 100.0   # forward (cm)
+
+        self._orb_active = True
+        payload = json.dumps({
+            "type": "orb_pose",
+            "x": round(orb_x, 2),
+            "y": round(orb_y, 2),
+            "z": round(orb_z, 2),
+            "tracking": True,
+        }).encode()
+        try:
+            self._orb_sock.sendto(payload, self._orb_target)
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, f"[bridge] ORB send error: {e}")
+
     def run(self):
         last_data = None
         rate = rospy.Rate(20)
@@ -210,6 +271,7 @@ class TelloBridge:
 
     def close(self):
         self.sock.close()
+        self._orb_sock.close()
         rospy.loginfo("[bridge] Shutdown")
 
 

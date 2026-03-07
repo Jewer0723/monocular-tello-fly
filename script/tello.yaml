@@ -1,0 +1,46 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# Camera Parameters - 480x360 (scaled from 960x720 by 0.5)
+#--------------------------------------------------------------------------------------------
+Camera.type: "PinHole"
+
+Camera.fx: 455.036
+Camera.fy: 457.047
+Camera.cx: 242.762
+Camera.cy: 168.359
+
+Camera.k1: -0.005941
+Camera.k2:  0.055161
+Camera.p1: -0.006094
+Camera.p2:  0.003192
+
+Camera.width:  480
+Camera.height: 360
+
+Camera.fps: 15.0
+
+Camera.RGB: 0
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+ORBextractor.nFeatures:   1000
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels:     8
+ORBextractor.iniThFAST:   20
+ORBextractor.minThFAST:   7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize:       0.05
+Viewer.KeyFrameLineWidth:  1
+Viewer.GraphLineWidth:     0.9
+Viewer.PointSize:          2
+Viewer.CameraSize:         0.08
+Viewer.CameraLineWidth:    3
+Viewer.ViewpointX:         0
+Viewer.ViewpointY:         -0.7
+Viewer.ViewpointZ:         -3.5
+Viewer.ViewpointF:         500
