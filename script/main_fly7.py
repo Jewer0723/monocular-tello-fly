@@ -158,11 +158,11 @@ class RvizBridge:
         print(f"📡 RvizBridge 初始化 → UDP {host}:{port}")
 
     def send(self, tracker):
-        """每幀呼叫，內部 限速 10Hz"""
+        """每幀呼叫，內部限速 10Hz"""
         if not self._ok:
             return
         now = time.time()
-        if now - self._last_t < 0.1:   # 10Hz 限速
+        if now - self._last_t < 0.1:   # 10Hz
             return
         self._last_t = now
         try:
@@ -222,31 +222,23 @@ class FlightTracker:
         dt  = now - self.last_time
         self.last_time = now
 
-        if dt <= 0 or dt > 1.0:   # 跳過異常 dt
+        if dt <= 0 or dt > 1.0:
             return
 
         try:
-            # Tello SDK 速度單位：cm/s，已修正為機體座標系
-            vx_body = tello.get_speed_x()   # 機體右方
-            vy_body = tello.get_speed_y()   # 機體前方（SDK定義）
-            vz_body = tello.get_speed_z()   # 機體上方
-            yaw_deg = tello.get_yaw()       # 度，順時針為正（Tello 定義）
+            vx_body = float(tello.get_speed_x())
+            vy_body = float(tello.get_speed_y())
+            vz_body = float(tello.get_speed_z())
+            yaw_deg = float(tello.get_yaw())
         except Exception:
             return
 
         self.yaw = yaw_deg
-        yaw_rad  = math.radians(-yaw_deg)   # 轉為逆時針標準角
 
-        # 機體速度 → 世界座標速度（繞 Y 軸旋轉）
-        cos_y, sin_y = math.cos(yaw_rad), math.sin(yaw_rad)
-        world_vx =  cos_y * vx_body + sin_y * vy_body
-        world_vz = -sin_y * vx_body + cos_y * vy_body
-        world_vy =  vz_body
-
-        # 積分位移
-        self.x += world_vx * dt
-        self.y += world_vy * dt
-        self.z += world_vz * dt
+        # 軸映射（實測確認）
+        self.z += (-vx_body) * dt
+        self.x += (-vy_body) * dt
+        self.y +=   vz_body  * dt
 
         self.path.append((self.x, self.y, self.z, is_manual))
 
@@ -1154,7 +1146,7 @@ class TelloMissionController:
 
         # [v9] 隨機高度控制
         self._alt_next_time = float("inf")  # 起飛前不觸發
-        self._alt_ud_cmd    = 0              # 目前高度指令（+上/-下/0 靜止）
+        self._alt_ud_cmd    = 0              # 目前高度指令（+上/-下/0靜止）
 
         # [v3] 偽點雲視窗
         self.pcl_vis = PointCloudVisualizer(self.tracker)
