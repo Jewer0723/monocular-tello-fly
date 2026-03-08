@@ -104,6 +104,57 @@ Visualization Manager:
         tello: true
       Queue Size: 10
       Value: true
+    - Alpha: 1.0
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 60; 20
+      Color Transformer: AxisColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 200; 0
+      Min Color: 0; 100; 255
+      Name: ORB Map Points
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.05
+      Style: Flat Squares
+      Topic: /orb_slam3_ros/map_points
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 0; 200; 100
+      Enabled: true
+      Head Diameter: 0.1
+      Head Length: 0.05
+      Length: 0.1
+      Line Style: Billboards
+      Line Width: 0.04
+      Name: ORB Trajectory
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Radius: 0.03
+      Shaft Diameter: 0.05
+      Shaft Length: 0.05
+      Topic: /orb_slam3_ros/camera
+      Unreliable: false
+      Value: true
     - Class: rviz/TF
       Enabled: true
       Frame Timeout: 15
@@ -113,6 +164,8 @@ Visualization Manager:
           Value: true
         world:
           Value: true
+        camera:
+          Value: true
       Marker Scale: 0.4
       Name: TF Frames
       Show Arrows: false
@@ -121,6 +174,8 @@ Visualization Manager:
       Tree:
         world:
           tello:
+            {}
+          camera:
             {}
       Update Interval: 0
       Value: true
@@ -151,7 +206,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/ThirdPersonFollower
-      Distance: 20.0
+      Distance: 8.0
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.06
         Stereo Focal Distance: 1
@@ -160,7 +215,7 @@ Visualization Manager:
       Focal Point:
         X: 0
         Y: 0
-        Z: 1.0
+        Z: 0.5
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05
       Invert Z Axis: false

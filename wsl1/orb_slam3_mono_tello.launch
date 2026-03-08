@@ -1,0 +1,28 @@
+<launch>
+    <node name="orb_slam3_mono" pkg="orb_slam3_ros_wrapper"
+          type="orb_slam3_ros_wrapper_mono" output="screen">
+
+        <!-- Tello: publish directly to /camera/image_raw, no remap needed -->
+
+        <!-- Parameters for original ORB-SLAM3 -->
+        <param name="voc_file"      type="string"
+               value="$(env HOME)/ORB_SLAM3/Vocabulary/ORBvoc.txt" />
+        <param name="settings_file" type="string"
+               value="$(env HOME)/catkin_build/src/orb_slam3_ros_wrapper/config/tello.yaml" />
+
+        <!-- ROS frame IDs -->
+        <param name="map_frame_id"  type="string" value="world" />
+        <param name="pose_frame_id" type="string" value="camera" />
+    </node>
+
+    <!-- hector_trajectory_server: tracks camera path in world frame -->
+    <node pkg="hector_trajectory_server" type="hector_trajectory_server"
+          name="trajectory_server_orb_slam3" output="screen" ns="orb_slam3_ros">
+        <param name="/target_frame_name"        value="/world" />
+        <param name="/source_frame_name"        value="/camera" />
+        <param name="/trajectory_update_rate"   value="20.0" />
+        <param name="/trajectory_publish_rate"  value="20.0" />
+    </node>
+
+    <!-- NOTE: We use our own tello_rviz.rviz, so orb_slam3 rviz is disabled -->
+</launch>

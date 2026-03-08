@@ -12,7 +12,6 @@ Tello 四階段任務控制系統（優化版 v5）
 """
 
 import torch
-import socket
 import cv2
 import numpy as np
 from djitellopy import Tello
@@ -27,6 +26,7 @@ import math
 import threading
 from datetime import datetime
 import json
+import socket
 
 # open3d 為可選依賴，沒安裝時關閉點雲視窗
 try:
@@ -51,6 +51,7 @@ class DroneState:
     FORWARD        = "FORWARD"         # 前進接近目標模式
     CIRCLE         = "CIRCLE"          # 環繞掃描模式（偵測條碼）
     QR_SCAN        = "QR_SCAN"         # QR Code掃描模式（鎖定靠近）
+    RETURN_HOME    = "RETURN_HOME"     # 低電量直線返航降落
 
 # ===================== MidAS 巡航參數 =====================
 MIDAS_CONFIG = {
@@ -151,8 +152,6 @@ class RvizBridge:
     封包格式：JSON {"x":float,"y":float,"z":float,"yaw":float,"home":[x,z]}
     """
     def __init__(self, host: str = "127.0.0.1", port: int = 9999):
-        import socket, json as _json
-        self._json   = _json
         self._sock   = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._addr   = (host, port)
         self._last_t = 0.0
@@ -168,7 +167,7 @@ class RvizBridge:
             return
         self._last_t = now
         try:
-            payload = self._json.dumps({
+            payload = json.dumps({
                 "x":   round(tracker.x,   1),
                 "y":   round(tracker.y,   1),
                 "z":   round(tracker.z,   1),
@@ -355,10 +354,16 @@ class FlightTracker:
 
         self.yaw = yaw_deg
 
+        # ZUPT：速度過小視為靜止，不積分（減少靜止漂移）
+        ZUPT_THRESH = 2.0  # cm/s，低於此視為感測噪音
+        vx_eff = vx_body if abs(vx_body) > ZUPT_THRESH else 0.0
+        vy_eff = vy_body if abs(vy_body) > ZUPT_THRESH else 0.0
+        vz_eff = vz_body if abs(vz_body) > ZUPT_THRESH else 0.0
+
         # 軸映射（實測確認）
-        self.z += (-vx_body) * dt
-        self.x += (-vy_body) * dt
-        self.y +=   vz_body  * dt
+        self.z += (-vx_eff) * dt
+        self.x += (-vy_eff) * dt
+        self.y +=   vz_eff  * dt
 
         self.path.append((self.x, self.y, self.z, is_manual))
 
@@ -1243,6 +1248,97 @@ class QRScanner(TargetTracker):
 
 
 
+
+# ===================== 低電量返航控制器 =====================
+class ReturnHomeController:
+    """
+    低電量自動返航降落控制器。
+    三階段：fly（直線飛回起飛點）→ hover（懸停 2 秒穩定）→ land（降落）
+
+    使用方式（TelloMissionController）：
+        self.return_home = ReturnHomeController(tello, tracker)
+        self.return_home.start()        # 觸發（change_state 時呼叫）
+        rc = self.return_home.get_rc()  # 主迴圈每幀呼叫
+    """
+    ARRIVE_CM   = 10      # 距起飛點此距離(cm)視為到達
+    HOVER_SEC   = 2.0     # 到達後懸停秒數
+    SPEED       = 20      # 返航飛行速度
+    DESCEND_SPD = -8      # 接近地面時下降速度
+    TARGET_H_CM = 60      # 開始緩降的高度門檻
+
+    def __init__(self, tello, tracker):
+        self.tello   = tello
+        self.tracker = tracker
+        self._phase  = "idle"
+        self._t      = 0.0
+
+    def start(self):
+        """觸發返航"""
+        dx   = self.tracker.home[0] - self.tracker.x
+        dz   = self.tracker.home[2] - self.tracker.z
+        dist = math.sqrt(dx**2 + dz**2)
+        print(f"[ReturnHome] 啟動：距起飛點 {dist:.0f}cm")
+        self._phase = "fly"
+        self._t     = time.time()
+
+    def get_rc(self) -> list:
+        """每幀呼叫，回傳 [lr, fb, ud, yaw]"""
+        if self._phase == "idle":
+            return [0, 0, 0, 0]
+
+        dx      = self.tracker.home[0] - self.tracker.x
+        dz      = self.tracker.home[2] - self.tracker.z
+        dist_cm = math.sqrt(dx**2 + dz**2)
+        elapsed = time.time() - self._t
+
+        if self._phase == "fly":
+            if dist_cm > self.ARRIVE_CM:
+                total   = max(dist_cm, 1.0)
+                # 世界座標方向向量（歸一化）
+                ndx = dx / total   # +X = 右
+                ndz = dz / total   # +Z = 前
+
+                # 旋轉到機體座標（補償 yaw）
+                # Tello yaw 順時針為正，0° = +Z 方向
+                yaw_r = math.radians(self.tracker.yaw)
+                # 機體前方在世界座標投影
+                fb_v = int(self.SPEED * (
+                     ndz * math.cos(yaw_r) + ndx * math.sin(yaw_r)))
+                # 機體右方在世界座標投影
+                lr_v = int(self.SPEED * (
+                     ndx * math.cos(yaw_r) - ndz * math.sin(yaw_r)))
+
+                try:    cur_h = self.tello.get_height()
+                except: cur_h = 80
+                ud_v = self.DESCEND_SPD if cur_h > self.TARGET_H_CM else 0
+                return [lr_v, fb_v, ud_v, 0]
+            else:
+                print("[ReturnHome] 到達起飛點，懸停中...")
+                self._phase = "hover"
+                self._t     = time.time()
+                return [0, 0, 0, 0]
+
+        elif self._phase == "hover":
+            if elapsed >= self.HOVER_SEC:
+                print("[ReturnHome] 降落")
+                self._phase = "land"
+                self.tello.land()
+            return [0, 0, 0, 0]
+
+        else:  # land
+            return [0, 0, 0, 0]
+
+    def is_active(self) -> bool:
+        return self._phase != "idle"
+
+    def is_landing(self) -> bool:
+        return self._phase == "land"
+
+    @property
+    def phase(self) -> str:
+        return self._phase
+
+
 # ===================== 主控制器 =====================
 class TelloMissionController:
     def __init__(self):
@@ -1262,8 +1358,9 @@ class TelloMissionController:
         self.tracker = FlightTracker()
 
         # [v9] RViz UDP 橋接（選用，bridge_node.py 不開時靜默）
-        self.rviz_bridge = RvizBridge()
-        self.orb = OrbCorrector()
+        self.rviz_bridge  = RvizBridge()
+        self.orb          = OrbCorrector()
+        self.return_home  = ReturnHomeController(self.tello, self.tracker)
         self._scanned_popup_until = 0.0  # popup 顯示到此時間戳
 
         # [v9] 隨機高度控制
@@ -1328,7 +1425,9 @@ class TelloMissionController:
         self.current_state = new_state
         self.state_start_time = time.time()
 
-        if new_state == DroneState.FORWARD:
+        if new_state == DroneState.RETURN_HOME:
+            self.return_home.start()
+        elif new_state == DroneState.FORWARD:
             self.forward.start()
         elif new_state == DroneState.CIRCLE:
             self.circle.start()
@@ -1378,8 +1477,8 @@ class TelloMissionController:
 
         if bat <= LOW_BATTERY_CONFIG["THRESHOLD"] and not self._low_battery_triggered:
             self._low_battery_triggered = True
-            print(f"🔋 低電量警告！電量={bat}%，請手動降落（L 鍵）")
-            self.tello.send_rc_control(0, 0, 0, 0)
+            print(f"🔋 低電量！電量={bat}%，自動返航")
+            self.change_state(DroneState.RETURN_HOME)
 
     def run(self):
         print("\n" + "="*50)
@@ -1607,6 +1706,10 @@ class TelloMissionController:
                                 print("⏰ QR掃描超時，返回巡航")
                                 self.change_state(DroneState.MIDAS)
 
+
+                    # ── RETURN_HOME 低電量直線返航 ──────────────────────
+                    if self.current_state == DroneState.RETURN_HOME:
+                        control_cmd = self.return_home.get_rc()
 
                     current_time = time.time()
                     if current_time - last_control_time >= CONTROL_INTERVAL:
