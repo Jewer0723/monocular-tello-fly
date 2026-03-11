@@ -1,0 +1,48 @@
+先連到tello wifi
+
+xlaunch下載連結 : https://sourceforge.net/projects/vcxsrv/
+
+xLaunch 調整:
+Multiple windows
+Display number : 0
+Start no client
+Clipboard
+Native opengl
+Disable access control
+
+/*****************************************************************************************/
+
+roscore
+
+/*****************************************************************************************/
+
+source /opt/ros/noetic/setup.bash
+cd ~/tello_bridge
+python3 bridge_node.py
+
+/*****************************************************************************************/
+
+source /opt/ros/noetic/setup.bash
+rviz -d ~/tello_bridge/tello_rviz.rviz
+
+/*****************************************************************************************/
+
+執行main_fly
+
+/*****************************************************************************************/
+
+先啟動main_fly再執行下面wsl1指令
+
+~/tello_bridge/start_tello_orb.sh
+
+/*****************************************************************************************/
+
+
+
+
+
+
+
+
+
+

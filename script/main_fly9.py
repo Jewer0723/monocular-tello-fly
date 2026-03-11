@@ -117,7 +117,7 @@ QR_SCAN_CONFIG = {
 
 # ===================== [v3] 低電量回航參數 =====================
 LOW_BATTERY_CONFIG = {
-    "THRESHOLD":          30,   # 低於此電量(%)觸發回航
+    "THRESHOLD":          50,   # 低於此電量(%)觸發回航
     "CHECK_INTERVAL":   5,     # 每幾秒查一次電量
     "RETURN_SPEED":       20,   # 回航飛行速度
     "YAW_KP":            0.8,   # 偏航修正係數
@@ -190,43 +190,41 @@ class RvizBridge:
             pass
 
 
-# ══════════════════════════════════════════════════════════════
-# OrbCorrector: send frames to WSL1, receive ORB-SLAM3 corrections
-# ══════════════════════════════════════════════════════════════
+# ===================== 修改 OrbCorrector 類 =====================
 class OrbCorrector:
     """
     TX: sends JPEG frames to WSL1 :9998 for ORB-SLAM3 input
     RX: receives corrected pose from WSL1 :9997, applies to FlightTracker
 
-    Scale estimation:
-      ORB monocular has no absolute scale. We use Tello get_height() as
-      vertical reference: scale = tello_height_cm / orb_y (when orb_y != 0).
-      Scale is smoothed with EMA and applied to x/z.
+    改良版：接收 bridge 處理後的 ORB 位置（不會重置）
     """
-    CAM_PORT  = 9998
+    CAM_PORT = 9998
     CORR_PORT = 9997
-    JPEG_Q    = 60
-    SEND_HZ   = 15
+    JPEG_Q = 60
+    SEND_HZ = 15
 
     def __init__(self, wsl_host: str = "127.0.0.1"):
-        self._tx_sock   = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._tx_addr   = (wsl_host, self.CAM_PORT)
+        self._tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._tx_addr = (wsl_host, self.CAM_PORT)
         self._tx_last_t = 0.0
 
         self._rx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._rx_sock.bind(("0.0.0.0", self.CORR_PORT))
         self._rx_sock.settimeout(0.0)  # non-blocking
 
-        self._scale     = None
+        self._scale = None
         self._scale_ema = 0.1
-        self._active    = False
+        self._active = False
+
+        # 新增：記錄最後收到的 ORB 位置
+        self.last_orb_x = 0.0
+        self.last_orb_y = 0.0
+        self.last_orb_z = 0.0
+        self.last_receive_time = 0
         print(f"OrbCorrector: TX->:9998  RX<-:9997")
 
     def send_frame(self, frame):
-        """
-        Resize to 480x360 before encoding to keep JPEG < 60KB (UDP limit ~65KB).
-        ORB-SLAM3 works well at 480x360; tello_cam_node uses scaled intrinsics.
-        """
+        """發送影像到 WSL1"""
         now = time.time()
         if now - self._tx_last_t < 1.0 / self.SEND_HZ:
             return
@@ -239,7 +237,6 @@ class OrbCorrector:
                 return
             data = buf.tobytes()
             if len(data) > 65000:
-                # Fallback: lower quality if still too large
                 ok, buf = cv2.imencode(".jpg", small,
                                        [cv2.IMWRITE_JPEG_QUALITY, 40])
                 if not ok:
@@ -250,53 +247,44 @@ class OrbCorrector:
             pass
 
     def poll_correction(self, tracker, tello):
+        """接收 bridge 處理後的 ORB 位置"""
         try:
             raw, _ = self._rx_sock.recvfrom(4096)
             msg = json.loads(raw.decode())
         except Exception:
-            # Catches BlockingIOError, socket.timeout,
-            # and Windows WSAEWOULDBLOCK (errno 10035)
             return False
 
         if msg.get("type") != "orb_pose" or not msg.get("tracking"):
             return False
 
+        # 接收 bridge 傳來的 ORB 位置
         orb_x = msg["x"]
         orb_y = msg["y"]
         orb_z = msg["z"]
 
-        try:
-            tello_h = float(tello.get_height())
-        except Exception:
-            tello_h = None
+        self.last_orb_x = orb_x
+        self.last_orb_y = orb_y
+        self.last_orb_z = orb_z
+        self.last_receive_time = time.time()
 
-        if tello_h and tello_h > 20 and abs(orb_y) > 0.05:
-            raw_scale = tello_h / abs(orb_y)
-            raw_scale = max(5.0, min(500.0, raw_scale))
-            if self._scale is None:
-                self._scale = raw_scale
-            else:
-                a = self._scale_ema
-                self._scale = a * raw_scale + (1 - a) * self._scale
+        # 更新 tracker 位置（直接使用 bridge 處理後的位置）
+        tracker.x = orb_x
+        tracker.y = orb_y
+        tracker.z = orb_z
 
-        if self._scale is None:
-            return False
-
-        tracker.x = orb_x * self._scale
-        tracker.y = orb_y * self._scale
-        tracker.z = orb_z * self._scale
         if not self._active:
-            print(f"[ORB] First correction applied! scale={self._scale:.2f}")
+            print(f"[ORB] First correction applied! pos=({orb_x:.1f},{orb_y:.1f},{orb_z:.1f})cm")
         self._active = True
         self._corr_count = getattr(self, '_corr_count', 0) + 1
         if self._corr_count % 50 == 0:
-            print(f"[ORB] Corrections applied: {self._corr_count}  "+
+            print(f"[ORB] Corrections applied: {self._corr_count}  " +
                   f"pos=({tracker.x:.1f},{tracker.y:.1f},{tracker.z:.1f})cm")
         return True
 
     @property
     def active(self):
-        return self._active
+        """ORB 是否活躍（最近 1 秒內有收到資料）"""
+        return (time.time() - self.last_receive_time) < 1.0
 
     def close(self):
         try:
@@ -1245,85 +1233,139 @@ class QRScanner(TargetTracker):
         return super().should_abort()
 
 
-
-
-# ===================== 低電量返航控制器 =====================
+# ===================== 航向鎖定返航控制器 =====================
 class ReturnHomeController:
     """
     低電量自動返航降落控制器。
-    三階段：fly（直線飛回起飛點）→ hover（懸停 2 秒穩定）→ land（降落）
-
-    RC 座標推導（FlightTracker 軸映射確認）：
-      tracker.z += (-vgx)*dt, tracker.x += (-vgy)*dt
-      fb>0 => vgy 增 => tracker.x 減 => 往 -x 方向
-      lr>0 => vgx 增 => tracker.z 減 => 往 -z 方向
-      yaw=0 時到達 (dx,dz): fb = -(ndx*sin+ndz*cos), lr = -(ndx*cos-ndz*sin)
-
-    無超時：fly 階段飛到真正到達起飛點 ARRIVE_CM 以內才切換 hover。
+    航向鎖定版：機頭永遠朝向目的地，直線前進
     """
-    ARRIVE_CM   = 30     # 距起飛點此距離(cm)視為到達
-    HOVER_SEC   = 2.0    # 到達後懸停秒數
-    SPEED       = 20     # 返航飛行速度 (cm/s RC 值)
-    DESCEND_SPD = -8     # 接近地面時下降速度
-    TARGET_H_CM = 60     # 開始緩降的高度門檻
+    ARRIVE_CM = 5  # 距起飛點此距離(cm)視為到達
+    HOVER_SEC = 2.0  # 到達後懸停秒數
+    SPEED = 30  # 返航飛行速度
+    DESCEND_SPD = -10  # 下降速度
+    TARGET_H_CM = 50  # 開始下降的高度門檻
+    YAW_SPEED = 40  # 最大轉向速度
 
     def __init__(self, tello, tracker):
-        self.tello   = tello
+        self.tello = tello
         self.tracker = tracker
-        self._phase  = "idle"
-        self._t      = 0.0
+        self._phase = "idle"
+        self._t = 0.0
+        self._last_yaw_error = 0
+        self._yaw_integral = 0
 
     def start(self):
         """觸發返航"""
-        dx   = self.tracker.home[0] - self.tracker.x
-        dz   = self.tracker.home[2] - self.tracker.z
-        dist = math.sqrt(dx**2 + dz**2)
+        dx = self.tracker.home[0] - self.tracker.x
+        dz = self.tracker.home[2] - self.tracker.z
+        dist = math.sqrt(dx ** 2 + dz ** 2)
         print(f"[ReturnHome] 啟動：估計距離={dist:.0f}cm")
         self._phase = "fly"
-        self._t     = time.time()
+        self._t = time.time()
+        self._yaw_integral = 0
+
+    def _calculate_yaw_error(self, target_yaw):
+        """計算偏航誤差（-180 到 180 度）"""
+        error = target_yaw - self.tracker.yaw
+        while error > 180:
+            error -= 360
+        while error < -180:
+            error += 360
+        return error
 
     def get_rc(self) -> list:
-        """每幀呼叫，回傳 [lr, fb, ud, yaw]。無超時，飛到到達才切換。"""
+        """每幀呼叫，回傳 [lr, fb, ud, yaw]"""
         if self._phase == "idle":
             return [0, 0, 0, 0]
 
         elapsed = time.time() - self._t
 
+        # ------------------------------------------------------------
+        # 飛行階段：先轉向目的地，然後直線前進
+        # ------------------------------------------------------------
         if self._phase == "fly":
-            dx      = self.tracker.home[0] - self.tracker.x
-            dz      = self.tracker.home[2] - self.tracker.z
-            dist_cm = math.sqrt(dx**2 + dz**2)
+            # 計算到起飛點的向量
+            dx = self.tracker.home[0] - self.tracker.x
+            dz = self.tracker.home[2] - self.tracker.z
+            dist_cm = math.sqrt(dx ** 2 + dz ** 2)
 
-            if dist_cm > self.ARRIVE_CM:
-                total = max(dist_cm, 1.0)
-                ndx   = dx / total
-                ndz   = dz / total
-
-                # 世界座標 (ndx, ndz) → 機體 RC 指令
-                # 推導自 FlightTracker 軸映射（見 class docstring）
-                yaw_r = math.radians(self.tracker.yaw)
-                fb_v  = -int(self.SPEED * (
-                    ndx * math.sin(yaw_r) + ndz * math.cos(yaw_r)))
-                lr_v  = -int(self.SPEED * (
-                    ndx * math.cos(yaw_r) - ndz * math.sin(yaw_r)))
-
-                try:    cur_h = self.tello.get_height()
-                except: cur_h = 80
-                ud_v = self.DESCEND_SPD if cur_h > self.TARGET_H_CM else 0
-                return [lr_v, fb_v, ud_v, 0]
-            else:
-                print(f"[ReturnHome] 到達起飛點（dist={dist_cm:.0f}cm），懸停...")
+            # 到達檢查
+            if dist_cm <= self.ARRIVE_CM:
+                print(f"[ReturnHome] 到達起飛點附近 (dist={dist_cm:.0f}cm)，懸停...")
                 self._phase = "hover"
-                self._t     = time.time()
+                self._t = time.time()
                 return [0, 0, 0, 0]
 
+            # 計算目標偏航角（指向目的地）
+            if abs(dx) < 0.1 and abs(dz) < 0.1:
+                target_yaw = 0
+            else:
+                target_yaw = math.degrees(math.atan2(dx, dz))
+
+            # 計算偏航誤差
+            yaw_error = self._calculate_yaw_error(target_yaw)
+
+            # PID 控制偏航
+            # P 項
+            p_term = 0.8 * yaw_error
+
+            # I 項（防止靜態誤差）
+            self._yaw_integral += yaw_error * 0.01  # dt 約 0.01 秒
+            self._yaw_integral = max(-100, min(100, self._yaw_integral))  # 限制積分量
+            i_term = 0.05 * self._yaw_integral
+
+            # D 項（減少震盪）
+            d_term = 0.1 * (yaw_error - self._last_yaw_error)
+
+            # 計算偏航指令
+            yaw_cmd = int(p_term + i_term + d_term)
+            yaw_cmd = max(-self.YAW_SPEED, min(self.YAW_SPEED, yaw_cmd))
+
+            self._last_yaw_error = yaw_error
+
+            # --------------------------------------------------------
+            # 航向鎖定：只有當機頭接近目標方向時才前進
+            # --------------------------------------------------------
+            if abs(yaw_error) < 30:  # 誤差小於30度才前進
+                # 前進速度（距離越近越慢）
+                speed = min(self.SPEED, max(8, int(dist_cm / 8)))
+                fb_v = speed
+                lr_v = 0  # 不側移，只前進
+            else:
+                # 誤差太大時，先轉向不前進
+                fb_v = 0
+                lr_v = 0
+                if abs(yaw_error) > 10:  # 每幀都顯示轉向訊息
+                    print(f"[Return] 轉向中... 誤差={yaw_error:.0f}°, cmd={yaw_cmd}")
+
+            # 高度控制（緩慢下降）
+            try:
+                cur_h = self.tello.get_height()
+            except:
+                cur_h = 80
+
+            ud_v = self.DESCEND_SPD if cur_h > self.TARGET_H_CM else 0
+
+            # 調試輸出（每秒幾次）
+            if int(time.time() * 5) % 10 == 0:
+                print(f"[Return] dist={dist_cm:.0f}cm, yaw_err={yaw_error:.0f}°, "
+                      f"yaw_cmd={yaw_cmd}, fb={fb_v}, target_yaw={target_yaw:.0f}°")
+
+            return [lr_v, fb_v, ud_v, yaw_cmd]
+
+        # ------------------------------------------------------------
+        # 懸停階段：到達後穩定
+        # ------------------------------------------------------------
         elif self._phase == "hover":
             if elapsed >= self.HOVER_SEC:
-                print("[ReturnHome] 降落")
+                print("[ReturnHome] 懸停完成，開始降落")
                 self._phase = "land"
                 self.tello.land()
             return [0, 0, 0, 0]
 
+        # ------------------------------------------------------------
+        # 降落階段
+        # ------------------------------------------------------------
         else:  # land
             return [0, 0, 0, 0]
 
@@ -1336,7 +1378,6 @@ class ReturnHomeController:
     @property
     def phase(self) -> str:
         return self._phase
-
 
 # ===================== 主控制器 =====================
 class TelloMissionController:

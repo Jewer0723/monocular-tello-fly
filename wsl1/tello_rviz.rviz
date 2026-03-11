@@ -166,7 +166,7 @@ Visualization Manager:
           Value: true
         camera:
           Value: true
-      Marker Scale: 0.4
+      Marker Scale: 2
       Name: TF Frames
       Show Arrows: false
       Show Axes: true
