@@ -1,22 +1,24 @@
 """
-main_fly10.py — Tello 四階段任務控制系統
+Tello 四階段任務控制系統（優化版 v5）
 狀態機: MIDAS → FORWARD → CIRCLE → QR_SCAN → MIDAS
 
-架構：
-  - 移除 ORB-SLAM3 / RViz / FlightTracker / PointCloudVisualizer
-  - 新增 pan+tilt 雲台追蹤系統（ESP32 串口控制）
-  - 返航流程：ReturnHomeController（DR 飛回）
-             → GimbalTracker（角度重播 + YOLO 搜尋）
-             → 視覺引導對中降落
+修改紀錄：
+  [Fix 1] box2 辨識過濾：加入長寬比、畫面佔比、最小面積後處理，conf 提高至 0.75
+  [Fix 2] 環繞 yaw 跟不上：降低環繞速度、提高 yaw 修正上限、移除 yaw 縮小係數、縮短控制間隔
+  [Fix 3] 條碼掃不到：ROI 強制放大、加銳化/OTSU 預處理、TARGET_AREA 增大、對全帧兜底解碼
+  [v3]   新增飛行軌跡紀錄器（航位推算）、低電量自動回航降落、MiDaS 偽點雲即時顯示
+  [v5]   回航改為 ArUco 視覺導引降落（前視搜尋→接近→切下視精確對準→降落）
+         放棄不可靠的位置估算，純視覺回航
 """
+
 import csv
+import json
 import math
 import os
-import threading
+import socket
 import time
 from collections import deque
 from datetime import datetime
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -24,23 +26,18 @@ import pygame
 import torch
 from djitellopy import Tello
 from pyzbar import pyzbar
+from typing import List
 from ultralytics import YOLO
 
-# ===================== 全域設定 =====================
+# ===================== 全局配置 =====================
 FRAME_W, FRAME_H = 640, 480
-DRONE_FRAME_W, DRONE_FRAME_H = 640, 320
-CONTROL_INTERVAL = 0.05
-
-# ── 模型路徑 ──────────────────────────────────────────────────────
-MODEL_DIR          = "../model"
-box_model_path     = f"{MODEL_DIR}/box2.pt"
-barcode_model_path = f"{MODEL_DIR}/barcode1.pt"
-DRONE_MODEL_PATH   = f"{MODEL_DIR}/drone1.pt"  # 無人機偵測模型（雲台 + webcam 降落用）
+CONTROL_INTERVAL = 0.05          # [Fix 2] 原 0.1 → 0.05，提高控制頻率
 box_conf = 0.7
-qr_conf  = 0.7
-drone_conf = 0.4
+qr_conf = 0.7
+box_model_path = "../model/box2.pt"
+barcode_model_path = "../model/barcode1.pt"
 
-# ===================== 飛行狀態 =====================
+# ===================== 狀態定義 =====================
 class DroneState:
     MIDAS          = "MIDAS"           # 巡航避障模式
     FORWARD        = "FORWARD"         # 前進接近目標模式
@@ -80,12 +77,12 @@ FORWARD_CONFIG = {
 
 # ===================== 環繞掃描參數 =====================
 CIRCLE_CONFIG = {
-    "ORBIT_SPEED":           7,   # 原 7 → 5，降低環繞速度
-    "YAW_CORRECTION_SPEED": 25,   # 原 15 → 25，提高 yaw 修正上限
+    "ORBIT_SPEED":           7,   # [Fix 2] 原 7 → 5，降低環繞速度
+    "YAW_CORRECTION_SPEED": 25,   # [Fix 2] 原 15 → 25，提高 yaw 修正上限
     "HEIGHT_CORRECTION_SPEED": 15,
     "MIN_CIRCLE_TIME":        5,
     "MAX_CIRCLE_TIME":       30,
-    "TARGET_LOST_TIMEOUT":    1,  # 原 1 → 2，容許短暫丟失
+    "TARGET_LOST_TIMEOUT":    1,  # [Fix 2] 原 1 → 2，容許短暫丟失
     "TARGET_AREA":       120000,
     "AREA_TOLERANCE":      5000,
     "KP_FORWARD":         0.0006,
@@ -94,7 +91,7 @@ CIRCLE_CONFIG = {
 
 # ===================== QR掃描參數 =====================
 QR_SCAN_CONFIG = {
-    "TARGET_AREA":          60000,  # 原 20000 → 60000，確保靠得夠近
+    "TARGET_AREA":          60000,  # [Fix 3] 原 20000 → 60000，確保靠得夠近
     "AREA_TOLERANCE":        5000,
     "KP_YAW":               0.25,
     "KP_UPDOWN":            0.25,
@@ -105,59 +102,237 @@ QR_SCAN_CONFIG = {
     "MAX_EXECUTION_TIME":    30,
     "QR_SCAN_INTERVAL":      0.3,
     "FORWARD_WHEN_NO_DECODE": True,
-    "MIN_AREA_BEFORE_DECODE": 40000,  # 原 1000 → 40000
+    "MIN_AREA_BEFORE_DECODE": 40000,  # [Fix 3] 原 1000 → 40000
     "CSV_FILE":              "scanned_codes.csv"
 }
 
-# ===================== USB 鏡頭參數 =====================
-WEBCAM_CONFIG = {
-    "HANDOFF_DIST_CM"  : 200,    # DR 估算距起飛點 < 200cm 時啟用
-    "LAND_AREA_THRESH" : 100000  # 降落面積閾值，實測後調整
-}
 
-# ===================== 雲台參數 =====================
-GIMBAL_CONFIG = {
-    "SERIAL_PORT":       "COM3",
-    "SERIAL_BAUD":       115200,
-    "PAN_CENTER":        90,
-    "TILT_CENTER":       90,
-    "PAN_MIN":           0,
-    "PAN_MAX":           180,
-    "TILT_MIN":          50,
-    "TILT_MAX":          130,
-    "KP_PAN":            0.04,
-    "KP_TILT":           0.03,
-    "DEADZONE_PX":       30,
-    "MAX_HISTORY":       3000,  # 最多記錄幀數
-    "RECORD_INTERVAL":   0.10,  # 每幾秒記錄一次
-    "REPLAY_SPEED":      1.5,    # 重播倍率（> 1 超前預測）
-    "REPLAY_INTERVAL":   0.08,   # 重播每幀間隔秒數
-    "DETECT_MIN_AREA":   400,
-    "LAND_AREA_THRESH":  100000,  # 降落面積閾值，實測後調整
-    # 梯度探測降落參數
-    "PROBE_SPEED":       15,     # 探測移動速度 RC 值
-    "PROBE_SEC":         0.6,    # 每個方向探測秒數
-    "MOVE_SEC":          0.8,    # 往最佳方向移動秒數
-    "LOST_HOVER_SEC":    999,    # 丟失後懸停（不交回 RTH）
-}
-
-# ===================== 返航參數 =====================
+# ===================== [v3] 低電量回航參數 =====================
 LOW_BATTERY_CONFIG = {
-    "THRESHOLD":          70,   # 低於此電量(%)觸發回航
+    "THRESHOLD":          50,   # 低於此電量(%)觸發回航
     "CHECK_INTERVAL":   5,     # 每幾秒查一次電量
     "RETURN_SPEED":       20,   # 回航飛行速度
     "YAW_KP":            0.8,   # 偏航修正係數
     "WAYPOINT_RADIUS":    60,   # 中繼航點到達容忍半徑(cm)
-    "LAND_RADIUS":        5,   # 起飛點降落容忍半徑(cm)
-    "ARRIVE_CM":          10,     # 距起飛點此距離(cm)視為到達
-    "HOVER_SEC":         2.0,    # 到達後懸停秒數
-    "SPEED":             20,     # 返航飛行速度 (cm/s RC 值)
-    "DESCEND_SPD":       -8,     # 接近地面時下降速度
-    "TARGET_H_CM":        60,     # 開始緩降的高度門檻
+    "LAND_RADIUS":        20,   # 起飛點降落容忍半徑(cm)
 }
 
+# ===================== [v9] RViz UDP 橋接發布器 =====================
+class RvizBridge:
+    """
+    把 FlightTracker 位置以 JSON over UDP 發送給 bridge_node.py。
+    bridge_node.py 跑在 WSL1 ROS 環境裡，負責轉發到 ROS topic。
 
-# ===================== MIDAS 巡航避障控制器 =====================
+    如果 bridge_node.py 沒有啟動，這個類別會靜默失敗，不影響主程式。
+
+    發布頻率：每幀最多 10Hz（避免 UDP 過頻）
+    封包格式：JSON {"x":float,"y":float,"z":float,"yaw":float,"home":[x,z]}
+    """
+    def __init__(self, host: str = "127.0.0.1", port: int = 9999):
+        self._sock   = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._addr   = (host, port)
+        self._last_t = 0.0
+        self._ok     = True
+        print(f"📡 RvizBridge 初始化 → UDP {host}:{port}")
+
+    def send(self, tracker):
+        """每幀呼叫，內部限速 10Hz"""
+        if not self._ok:
+            return
+        now = time.time()
+        if now - self._last_t < 0.1:   # 10Hz
+            return
+        self._last_t = now
+        try:
+            returning = getattr(self, '_returning', False)
+            payload = json.dumps({
+                "x":        round(tracker.x,   1),
+                "z":        round(tracker.z,   1),
+                "yaw":      round(tracker.yaw, 1),
+                "home":     [tracker.home[0], tracker.home[2]],
+                "returning": returning,
+            }).encode()
+            self._sock.sendto(payload, self._addr)
+        except Exception:
+            pass   # bridge 沒開時靜默失敗
+
+    def set_returning(self, val: bool):
+        """RETURN_HOME 狀態切換時呼叫，讓 bridge 顯示回航三角錐"""
+        self._returning = val
+
+    def close(self):
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+# ===================== 飛行軌跡紀錄器（航位推算）=====================
+class FlightTracker:
+    """
+    利用 Tello 的 get_speed_x/y/z() 與 get_yaw() 做航位推算。
+    座標系：
+      X = 右方（東）  Y = 上方  Z = 前方（北）
+    起飛點固定為原點 (0, 0, 0)，yaw=0。
+    """
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """完整重設，含起飛點（僅程式第一次 __init__ 時用）"""
+        self.x   = 0.0
+        self.y   = 0.0
+        self.z   = 0.0
+        self.yaw = 0.0
+        self.path: List[tuple] = [(0.0, 0.0, 0.0, False)]
+        self.last_time = time.time()
+        self.home      = (0.0, 0.0, 0.0)   # 起飛點（固定，不再被覆寫）
+
+    def reset_pose(self):
+        """起飛後呼叫：只清位移/軌跡，保留 home 不動"""
+        self.x   = 0.0
+        self.y   = 0.0
+        self.z   = 0.0
+        self.yaw = 0.0
+        self.path = [(0.0, 0.0, 0.0, False)]
+        self.last_time = time.time()
+        # self.home 不動 → 起飛點永遠是 (0,0,0)
+
+    def update(self, tello: "Tello", is_manual: bool = False):
+        """每幀呼叫一次，從感測器讀值更新位置。is_manual=True 標記手動段。"""
+        now = time.time()
+        dt  = now - self.last_time
+        self.last_time = now
+
+        if dt <= 0 or dt > 1.0:
+            return
+
+        try:
+            vx_body = float(tello.get_speed_x())
+            vy_body = float(tello.get_speed_y())
+            vz_body = float(tello.get_speed_z())
+            yaw_deg = float(tello.get_yaw())
+        except Exception:
+            return
+
+        self.yaw = yaw_deg
+
+        # 軸映射（實測確認）：直接積分，不做 yaw 旋轉
+        self.z += (-vx_body) * dt
+        self.x += (-vy_body) * dt
+        self.y +=   vz_body  * dt
+
+        self.path.append((self.x, self.y, self.z, is_manual))
+
+    def get_yaw_to_point(self, tx: float, tz: float) -> float:
+        """
+        回傳指向目標點(tx,tz)所需的偏航誤差(度)。
+        Tello yaw：順時針為正。atan2(dx,dz) 以+Z前方為0度，順時針遞增，
+        與 Tello 符號系完全一致，不需要再做符號翻轉。
+        """
+        dx = tx - self.x
+        dz = tz - self.z
+        if abs(dx) < 1 and abs(dz) < 1:
+            return 0.0
+        target_yaw = math.degrees(math.atan2(dx, dz))  # +Z=0°, +X=+90°
+        error = target_yaw - self.yaw                   # 同符號系，直接相減
+        while error >  180: error -= 360
+        while error < -180: error += 360
+        return error
+
+    def distance_to_home(self) -> float:
+        """水平距離(cm)"""
+        return math.sqrt((self.x - self.home[0])**2 +
+                         (self.z - self.home[2])**2)
+
+    def build_return_waypoints(self, step_cm: float = 80.0) -> list:
+        """
+        沿去程軌跡反向抽樣，產生回航航點列表（安全路徑）。
+        step_cm：相鄰航點最小間距，避免航點過密導致頻繁轉向。
+        回傳 [(x, z), ...] 依序為從當前位置到起飛點的各中繼點。
+        """
+        if len(self.path) < 2:
+            return [(self.home[0], self.home[2])]
+
+        waypoints = []
+        last_x, last_z = self.x, self.z
+        for pt in reversed(self.path):
+            px, pz = pt[0], pt[2]
+            d = math.sqrt((px - last_x)**2 + (pz - last_z)**2)
+            if d >= step_cm:
+                waypoints.append((px, pz))
+                last_x, last_z = px, pz
+
+        # 確保最後一點是起飛點
+        hx, hz = self.home[0], self.home[2]
+        if not waypoints or math.sqrt(
+                (waypoints[-1][0]-hx)**2 + (waypoints[-1][1]-hz)**2) > 20:
+            waypoints.append((hx, hz))
+
+        return waypoints
+
+    def draw_minimap(self, frame, size=160, margin=10):
+        """在畫面右上角繪製俯視軌跡小地圖"""
+        h, w = frame.shape[:2]
+        x0 = w - size - margin
+        y0 = margin
+
+        # 背景
+        cv2.rectangle(frame, (x0, y0), (x0+size, y0+size), (30, 30, 30), -1)
+        cv2.rectangle(frame, (x0, y0), (x0+size, y0+size), (100, 100, 100), 1)
+
+        if len(self.path) < 2:
+            return frame
+
+        # 自動縮放
+        xs = [p[0] for p in self.path]
+        zs = [p[2] for p in self.path]
+        span = max(max(xs)-min(xs), max(zs)-min(zs), 100)   # 最小 100cm
+        scale = (size - 20) / span
+
+        cx_map = x0 + size // 2
+        cy_map = y0 + size // 2
+        ox = (max(xs) + min(xs)) / 2
+        oz = (max(zs) + min(zs)) / 2
+
+        def to_px(px, pz):
+            return (int(cx_map + (px - ox) * scale),
+                    int(cy_map - (pz - oz) * scale))
+
+        # 畫軌跡（自動段=水藍, 手動段=橘）
+        for i in range(1, len(self.path)):
+            p1 = to_px(self.path[i-1][0], self.path[i-1][2])
+            p2 = to_px(self.path[i][0],   self.path[i][2])
+            is_man = len(self.path[i]) > 3 and self.path[i][3]
+            color  = (0, 140, 255) if is_man else (0, 200, 255)
+            cv2.line(frame, p1, p2, color, 1)
+
+        # 起飛點（綠圓）
+        hp = to_px(self.home[0], self.home[2])
+        cv2.circle(frame, hp, 5, (0, 255, 0), -1)
+
+        # 目前位置（紅圓）
+        cp = to_px(self.x, self.z)
+        cv2.circle(frame, cp, 5, (0, 0, 255), -1)
+
+        # 距離標示
+        dist = self.distance_to_home()
+        cv2.putText(frame, f"HOME:{dist:.0f}cm", (x0+2, y0+size-4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+        cv2.putText(frame, "MAP", (x0+2, y0+12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+        return frame
+
+    def save_path_csv(self, filename="flight_path.csv"):
+        """儲存軌跡到 CSV"""
+        with open(filename, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["x_cm", "y_cm", "z_cm"])
+            writer.writerows(self.path)
+        print(f"📁 軌跡已儲存: {filename}")
+
+
+# ===================== MidAS 巡航避障控制器 =====================
 class MidASCruiser:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -269,7 +444,7 @@ class MidASCruiser:
 
         return frame
 
-# ===================== 目標追蹤基底類別 =====================
+# ===================== 目標追蹤基類 =====================
 class TargetTracker:
     def __init__(self, model_path, config):
         self.model  = YOLO(model_path)
@@ -292,7 +467,7 @@ class TargetTracker:
         self.target_center_history.clear()
 
     # ------------------------------------------------------------------
-    # 加入後處理過濾：長寬比、畫面佔比、最小面積
+    # [Fix 1] 加入後處理過濾：長寬比、畫面佔比、最小面積
     # ------------------------------------------------------------------
     def _is_valid_box(self, x1, y1, x2, y2):
         """過濾掉牆壁、櫃子等非紙箱物體"""
@@ -313,13 +488,13 @@ class TargetTracker:
             return False
         return True
 
-    def detect_target(self, frame, conf=box_conf):  # conf 預設提高至 0.75
+    def detect_target(self, frame, conf=box_conf):  # [Fix 1] conf 預設提高至 0.75
         results = self.model(frame, conf=conf, verbose=False)
 
         if results[0].boxes is not None and len(results[0].boxes) > 0:
             boxes = results[0].boxes
 
-            # 先過濾無效框
+            # [Fix 1] 先過濾無效框
             valid_boxes = []
             for b in boxes:
                 x1, y1, x2, y2 = map(int, b.xyxy[0])
@@ -472,7 +647,7 @@ class CircleScanner(TargetTracker):
             error_area = CIRCLE_CONFIG["TARGET_AREA"] - area
 
             # ----------------------------------------------------------
-            # yaw 修正：移除縮小係數，直接全力修正
+            # [Fix 2] yaw 修正：移除縮小係數，直接全力修正
             #         誤差大時暫停環繞讓 yaw 先追上目標
             # ----------------------------------------------------------
             if abs(error_x) > 120:
@@ -488,7 +663,7 @@ class CircleScanner(TargetTracker):
                 left_right = CIRCLE_CONFIG["ORBIT_SPEED"]
                 if abs(error_x) > FORWARD_CONFIG["DEADZONE"]:
                     yaw = self._clamp(
-                        int(FORWARD_CONFIG["KP_YAW"] * error_x),  # 移除 *0.3
+                        int(FORWARD_CONFIG["KP_YAW"] * error_x),  # [Fix 2] 移除 *0.3
                         -CIRCLE_CONFIG["YAW_CORRECTION_SPEED"],
                         CIRCLE_CONFIG["YAW_CORRECTION_SPEED"]
                     )
@@ -559,7 +734,7 @@ class CircleScanner(TargetTracker):
         # Bug Fix: 直接用基類邏輯，避免與基類的 target_lost_time 不同步。
         return super().should_abort()
 
-# ===================== QR 掃描控制器 =====================
+# ===================== QR掃描控制器 =====================
 class QRScanner(TargetTracker):
     """專門鎖定並掃描QR Code，無法解碼時持續前進"""
 
@@ -678,7 +853,7 @@ class QRScanner(TargetTracker):
             return 0, 0, 0, 0, None, 0, False, False, None
 
     # ------------------------------------------------------------------
-    # 強化解碼流程：ROI 放大 + 多種預處理 + 全帧兜底
+    # [Fix 3] 強化解碼流程：ROI 放大 + 多種預處理 + 全帧兜底
     # ------------------------------------------------------------------
     def decode_qr_code(self, frame, qr_bbox):
         """在QR Code區域內解碼"""
@@ -687,7 +862,7 @@ class QRScanner(TargetTracker):
 
         x1, y1, x2, y2 = qr_bbox
 
-        pad    = 40                              # 擴大 padding（原 20）
+        pad    = 40                              # [Fix 3] 擴大 padding（原 20）
         roi_x1 = max(0, x1 - pad)
         roi_y1 = max(0, y1 - pad)
         roi_x2 = min(FRAME_W, x2 + pad)
@@ -697,7 +872,7 @@ class QRScanner(TargetTracker):
         if roi.size == 0:
             return False, None
 
-        # 強制放大 ROI：pyzbar 對小圖解碼率極差
+        # [Fix 3] 強制放大 ROI：pyzbar 對小圖解碼率極差
         roi_h, roi_w = roi.shape[:2]
         min_dim      = min(roi_h, roi_w)
         if min_dim < 150:
@@ -707,7 +882,7 @@ class QRScanner(TargetTracker):
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        # 擴充預處理方法
+        # [Fix 3] 擴充預處理方法
         sharpening_kernel = np.array([[-1, -1, -1],
                                       [-1,  9, -1],
                                       [-1, -1, -1]])
@@ -718,13 +893,13 @@ class QRScanner(TargetTracker):
             cv2.adaptiveThreshold(gray, 255,
                                   cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                   cv2.THRESH_BINARY, 11, 2),                   # 自適應二值化
-            cv2.filter2D(gray, -1, sharpening_kernel),                          # 銳化
+            cv2.filter2D(gray, -1, sharpening_kernel),                          # [Fix 3] 銳化
             cv2.threshold(gray, 0, 255,
-                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],             # OTSU
-            cv2.bitwise_not(gray),                                              # 反色
+                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],             # [Fix 3] OTSU
+            cv2.bitwise_not(gray),                                              # [Fix 3] 反色
             cv2.bitwise_not(
                 cv2.threshold(gray, 0, 255,
-                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),        # 反色OTSU
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),        # [Fix 3] 反色OTSU
         ]
 
         for method in methods:
@@ -732,7 +907,7 @@ class QRScanner(TargetTracker):
             if barcodes:
                 return True, barcodes[0].data.decode("utf-8")
 
-        # 最後兜底：對整張 frame 解碼（不限 ROI）
+        # [Fix 3] 最後兜底：對整張 frame 解碼（不限 ROI）
         gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         barcodes  = pyzbar.decode(gray_full)
         if barcodes:
@@ -759,650 +934,139 @@ class QRScanner(TargetTracker):
         return super().should_abort()
 
 
-
-
-# ===================== 返航控制器（DR 飛回起飛點）=====================
-
-
-
-
-# ===================== 飛行位置追蹤器（Dead Reckoning）=====================
-class FlightTracker:
-    """
-    速度積分位置追蹤。
-    只保留位置計算，供 ReturnHomeController 和 GimbalTracker 使用。
-    座標系：x=左右, y=高度, z=前後（起飛點為原點）
-    """
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.x = self.y = self.z = 0.0
-        self.yaw  = 0.0
-        self.home = (0.0, 0.0, 0.0)
-        self.path: list = [(0.0, 0.0, 0.0, False)]
-        self.last_time = time.time()
-
-    def reset_pose(self):
-        """起飛後呼叫：清位移/軌跡，保留 home"""
-        self.x = self.y = self.z = 0.0
-        self.yaw = 0.0
-        self.path = [(0.0, 0.0, 0.0, False)]
-        self.last_time = time.time()
-
-    def update(self, tello, is_manual: bool = False):
-        now = time.time()
-        dt  = now - self.last_time
-        self.last_time = now
-        if dt <= 0 or dt > 1.0:
-            return
-        try:
-            vx  = float(tello.get_speed_x())
-            vy  = float(tello.get_speed_y())
-            vz  = float(tello.get_speed_z())
-            yaw = float(tello.get_yaw())
-        except Exception:
-            return
-        self.yaw  = yaw
-        self.z   += (-vx) * dt
-        self.x   += (-vy) * dt
-        self.y   +=   vz  * dt
-        self.path.append((self.x, self.y, self.z, is_manual))
-
-
-# ===================== Webcam 靜態視覺降落（固定鏡頭備援）=====================
-class WebcamLanding:
-    """
-    固定 webcam（正對起飛點）靜態視覺引導降落。
-    作為 GimbalTracker 的備援：當雲台無法使用時啟用。
-
-    流程：
-      APPROACH : YOLO 偵測 Tello，框框面積 < LAND_AREA_THRESH → 前進 + 對中
-      LAND     : 框框面積 >= LAND_AREA_THRESH → 降落
-    """
-    def __init__(self, tello, tracker, cam_index: int = 1):
-        self.cfg = WEBCAM_CONFIG
-        self.tello    = tello
-        self.tracker  = tracker
-        self._cam_idx = cam_index
-        self._cap     = None
-        self._active  = False
-        self._phase   = "idle"
-        self._lost_t  = 0.0
-        self._model   = YOLO(DRONE_MODEL_PATH)
-        self.last_frame = None
-        self.last_bbox  = None
-        self.last_area  = 0
-
-    def should_handoff(self) -> bool:
-        dx   = self.tracker.home[0] - self.tracker.x
-        dz   = self.tracker.home[2] - self.tracker.z
-        return math.sqrt(dx**2 + dz**2) < self.cfg["HANDOFF_DIST_CM"]
-
-    def start(self):
-        if self._active:
-            return
-        self._cap = cv2.VideoCapture(self._cam_idx)
-        if not self._cap.isOpened():
-            print(f"[WebcamLanding] ❌ webcam index={self._cam_idx} 無法開啟")
-            return
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  DRONE_FRAME_W)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  DRONE_FRAME_H)
-        self._active = True
-        self._phase  = "approach"
-        self._lost_t = 0.0
-        print("[WebcamLanding] ✅ 啟動")
-
-    def stop(self):
-        self._active = False
-        self._phase  = "idle"
-        if self._cap:
-            self._cap.release()
-            self._cap = None
-
-    def is_active(self) -> bool:
-        return self._active
-
-    def is_landing(self) -> bool:
-        return self._phase == "land"
-
-    def get_rc(self) -> list:
-        if not self._active or self._cap is None:
-            return [0, 0, 0, 0]
-        ret, frame = self._cap.read()
-        if not ret:
-            return [0, 0, 0, 0]
-        self.last_frame = frame.copy()
-        h, w = frame.shape[:2]
-        bbox = self._detect(frame)
-        self.last_bbox = bbox
-        if bbox is None:
-            self.last_area = 0
-            if self._lost_t == 0.0:
-                self._lost_t = time.time()
-            elif time.time() - self._lost_t > 2.0:
-                self.stop()
-            return [0, 0, 0, 0]
-        self._lost_t = 0.0
-        x1, y1, x2, y2 = bbox
-        area = (x2-x1) * (y2-y1)
-        self.last_area = area
-        if area >= self.cfg["LAND_AREA_THRESH"]:
-            self._phase = "land"
-            self.tello.land()
-            self.stop()
-            return [0, 0, 0, 0]
-        ex = (x1+x2)//2 - w//2
-        ey = (y1+y2)//2 - h//2
-        lr = int(0.06 * ex) if abs(ex) > 40 else 0
-        ud = int(-0.05 * ey) if abs(ey) > 30 else 0
-        lr = max(-30, min(30, lr))
-        ud = max(-20, min(20, ud))
-        return [lr, 18, ud, 0]
-
-    def draw_hud(self, main_frame):
-        if self.last_frame is None:
-            return main_frame
-        thumb = cv2.resize(self.last_frame, (320, 180))
-        if self.last_bbox is not None:
-            x1, y1, x2, y2 = self.last_bbox
-            sx = 320 / self.last_frame.shape[1]
-            sy = 180 / self.last_frame.shape[0]
-            cv2.rectangle(thumb, (int(x1*sx), int(y1*sy)),
-                          (int(x2*sx), int(y2*sy)), (0,255,0), 2)
-            cv2.putText(thumb, f"area:{self.last_area}",
-                (5, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,0), 1)
-        fh, fw = main_frame.shape[:2]
-        main_frame[fh-190:fh-10, 10:330] = thumb
-        cv2.rectangle(main_frame, (10, fh-190), (330, fh-10), (0,200,0), 1)
-        cv2.putText(main_frame, "WEBCAM LAND", (10, fh-195),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,100), 2)
-        return main_frame
-
-
-    def _detect(self, frame) -> Optional[tuple]:
-        if self._model is None:
-            return None
-        try:
-            results = self._model(frame, verbose=False, device=0)[0]
-            best_box, best_area = None, 400
-            for box in results.boxes:
-                if float(box.conf) < drone_conf:
-                    continue
-                x1,y1,x2,y2 = map(int, box.xyxy[0])
-                area = (x2-x1)*(y2-y1)
-                if area > best_area:
-                    best_area, best_box = area, (x1,y1,x2,y2)
-            return best_box
-        except Exception as e:
-            print(f"[WebcamLanding] detect: {e}")
-            return None
-
-
-class GimbalTracker:
-    """
-    pan+tilt 雲台追蹤控制器（ESP32 串口）。
-
-    生命週期：
-      程式啟動 → __init__() 載入模型 + 開 webcam + 開預覽視窗
-      每幀     → update_tracking() 偵測無人機、顯示 UI、起飛後送角度給雲台
-      起飛後   → start_tracking() 開串口、設 _tracking=True
-      進入返航 → start_return() 反向重播角度歷史
-      回航中每幀 → update_tracking() 同時做偵測，偵測到後 get_return_rc() 直接介入控制
-    """
-    def __init__(self, tello, tracker,
-                 cam_index: int = 1,
-                 port: str = GIMBAL_CONFIG["SERIAL_PORT"]):
-        self.cfg = GIMBAL_CONFIG
-        self.tello   = tello
-        self.tracker = tracker
-        self._port   = port
-
-        # 串口（起飛後才開）
-        self._serial      = None
-        self._serial_lock = threading.Lock()
-
-        # 狀態
-        self._tracking     = False   # 起飛後才為 True
-        self._returning    = False   # 進入返航後
-        self._visual_guide = False   # 已偵測到無人機，純視覺引導中
-        self._landed       = False
-
-        # 雲台角度
-        self._cur_pan  = self.cfg["PAN_CENTER"]
-        self._cur_tilt = self.cfg["TILT_CENTER"]
-
-        # 角度歷史
-        self._history: deque = deque(maxlen=self.cfg["MAX_HISTORY"])
-        self._last_record_t  = 0.0
-
-        # 返航重播
-        self._replay_list = []
-        self._replay_idx  = 0
-        self._last_replay_t = 0.0
-
-        # 視覺引導遺失計時
-        self._lost_t  = 0.0
-
-        # 最新偵測結果（update_tracking 更新，get_return_rc 直接用）
-        self._last_bbox  = None
-        self._last_area  = 0
-        self._last_frame = None   # update_tracking 讀到的 frame
-
-        # webcam + 模型（程式啟動就初始化）
-        self._cap   = None
-        self._preview_win = "Gimbal Webcam"
-        self._cam_idx = cam_index
-
-        # 直接載入模型（和 box2/barcode1 相同方式）
-        self._model = YOLO(DRONE_MODEL_PATH)
-        print(f"[Gimbal] ✅ 載入 {DRONE_MODEL_PATH}")
-        self._open_camera()
-        if self._cap is not None:
-            cv2.namedWindow(self._preview_win, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(self._preview_win, DRONE_FRAME_W, DRONE_FRAME_H)
-            print("[Gimbal] 預覽視窗開啟，等待起飛")
-
-    # ═══════════════════════════════════════════════════════════════
-    # 公開 API
-    # ═══════════════════════════════════════════════════════════════
-
-    def start_tracking(self):
-        """起飛後呼叫：開串口，開始讓雲台跟隨並記錄角度歷史"""
-        self._open_serial()
-        self._send_angle(self.cfg["PAN_CENTER"], self.cfg["TILT_CENTER"])
-        self._tracking = True
-        self._history.clear()
-        print("[Gimbal] ✅ 雲台追蹤啟動")
-
-    def update_tracking(self):
-        """
-        每幀必須呼叫（起飛前後都要呼叫）。
-
-        做三件事：
-          1. 讀 webcam frame + YOLO 偵測
-          2. 顯示預覽視窗（含偵測框 / 準線 / 狀態列）
-          3. 起飛後（_tracking=True）：送角度給雲台、記錄歷史
-        偵測結果存在 self._last_bbox / self._last_frame，
-        供 get_return_rc() 在同幀直接使用，不重複讀 webcam。
-        """
-        if self._cap is None:
-            return
-
-        ret, frame = self._cap.read()
-        if not ret:
-            return
-        self._last_frame = frame.copy()
-
-        h, w = frame.shape[:2]
-        cx, cy = w // 2, h // 2
-
-        bbox = self._detect(frame)
-        self._last_bbox = bbox
-        self._last_area = (bbox[2]-bbox[0])*(bbox[3]-bbox[1]) if bbox else 0
-
-        # ── 起飛後送角度給雲台 ───────────────────────────────────
-        if self._tracking and not self._returning and bbox is not None:
-            x1, y1, x2, y2 = bbox
-            ex = (x1+x2)//2 - cx
-            ey = (y1+y2)//2 - cy
-            p = self._cur_pan  + self.cfg["KP_PAN"]  * ex if abs(ex) > self.cfg["DEADZONE_PX"] else self._cur_pan
-            t = self._cur_tilt + self.cfg["KP_TILT"] * ey if abs(ey) > self.cfg["DEADZONE_PX"] else self._cur_tilt
-            p = max(self.cfg["PAN_MIN"],  min(self.cfg["PAN_MAX"],  p))
-            t = max(self.cfg["TILT_MIN"], min(self.cfg["TILT_MAX"], t))
-            if p != self._cur_pan or t != self._cur_tilt:
-                self._cur_pan, self._cur_tilt = p, t
-                self._send_angle(p, t)
-            # 記錄角度歷史
-            now = time.time()
-            if now - self._last_record_t >= self.cfg["RECORD_INTERVAL"]:
-                self._history.append((self._cur_pan, self._cur_tilt))
-                self._last_record_t = now
-
-        # ── 返航重播：在 update 裡推進雲台角度 ──────────────────
-        if self._returning and not self._visual_guide:
-            now = time.time()
-            if (self._replay_list and
-                    self._replay_idx < len(self._replay_list) and
-                    now - self._last_replay_t >= self.cfg["REPLAY_INTERVAL"] / self.cfg["REPLAY_SPEED"]):
-                pan, tilt = self._replay_list[self._replay_idx]
-                self._send_angle(pan, tilt)
-                self._cur_pan, self._cur_tilt = pan, tilt
-                self._replay_idx += 1
-                self._last_replay_t = now
-
-        # ── 繪製 UI ──────────────────────────────────────────────
-        display = frame.copy()
-        if bbox is not None:
-            x1, y1, x2, y2 = bbox
-            bx, by = (x1+x2)//2, (y1+y2)//2
-            cv2.rectangle(display, (x1,y1), (x2,y2), (0,255,0), 2)
-            cv2.circle(display, (bx, by), 5, (0,255,0), -1)
-            cv2.putText(display, f"DRONE  area:{self._last_area}",
-                (x1, max(y1-8, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 2)
-            cv2.arrowedLine(display, (cx,cy), (bx,by), (255,100,0), 2, tipLength=0.2)
-
-        # 準線
-        cross_col = (0,255,0) if bbox else (0,0,200)
-        cv2.line(display, (cx-20,cy),(cx+20,cy), cross_col, 1)
-        cv2.line(display, (cx,cy-20),(cx,cy+20), cross_col, 1)
-
-        # 狀態列
-        if self._visual_guide:
-            status = f"VISUAL GUIDE  area:{self._last_area}  pan:{self._cur_pan:.0f}  tilt:{self._cur_tilt:.0f}"
-            scol   = (0, 255, 100)
-        elif self._returning:
-            pct    = int(self._replay_idx / max(len(self._replay_list),1) * 100)
-            status = f"RETURN REPLAY {pct}%  pan:{self._cur_pan:.0f}  tilt:{self._cur_tilt:.0f}"
-            scol   = (0, 200, 255)
-        elif self._tracking:
-            status = f"TRACKING  pan:{self._cur_pan:.0f}  tilt:{self._cur_tilt:.0f}  hist:{len(self._history)}"
-            scol   = (0, 255, 180)
-        else:
-            status = "PREVIEW  (waiting for takeoff)"
-            scol   = (180, 180, 180)
-
-        cv2.putText(display, status, (10,24),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, scol, 2)
-        cv2.imshow(self._preview_win, display)
-        cv2.waitKey(1)
-
-    def start_return(self):
-        """進入返航：反向重播角度歷史，準備迎接無人機"""
-        self._returning    = True
-        self._visual_guide = False
-        self._landed       = False
-        self._lost_t       = 0.0
-        self._replay_list  = list(reversed(self._history))
-        self._replay_idx   = 0
-        self._last_replay_t = time.time()
-        # 重設梯度探測狀態
-        if hasattr(self, "_probe_phase"):
-            del self._probe_phase
-        print(f"[Gimbal] 返航模式，歷史幀={len(self._replay_list)}")
-        if not self._replay_list:
-            self._send_angle(self.cfg["PAN_CENTER"], self.cfg["TILT_CENTER"])
-
-    def get_return_rc(self) -> Optional[list]:
-        """
-        返航模式每幀呼叫（在 update_tracking 之後）。
-        直接用 update_tracking 存好的 _last_bbox，不重複讀 webcam。
-
-        回傳值：
-          None  → 尚未偵測到，讓 ReturnHomeController 繼續飛
-          list  → 視覺引導的 RC 指令 [lr, fb, ud, yaw]
-        """
-        if not self._returning:
-            return None
-
-        bbox = self._last_bbox
-
-        if bbox is not None:
-            self._last_area = (bbox[2]-bbox[0])*(bbox[3]-bbox[1])
-            self._lost_t = 0.0
-            if not self._visual_guide:
-                print(f"[Gimbal] ✅ 偵測到無人機（area={self._last_area}），介入控制")
-                self._visual_guide = True
-            return self._calc_visual_rc(bbox)
-        else:
-            if self._visual_guide:
-                # 丟失：原地懸停，不交回 RTH
-                return [0, 0, 0, 0]
-            return None   # 重播中未找到，讓 RTH 繼續
-
-    def is_active(self) -> bool:
-        return self._tracking or self._returning
-
-    def is_landing(self) -> bool:
-        return self._landed
-
-    def stop(self):
-        self._tracking  = False
-        self._returning = False
-        if self._cap:
-            self._cap.release()
-            self._cap = None
-        if self._serial:
-            try: self._serial.close()
-            except: pass
-        try:
-            cv2.destroyWindow(self._preview_win)
-        except Exception:
-            pass
-
-    def draw_hud(self, main_frame):
-        """在 Tello 主畫面左下角疊加 webcam 縮圖"""
-        f = self._last_frame
-        if f is None:
-            return main_frame
-        thumb = cv2.resize(f, (320, 180))
-        if self._last_bbox is not None:
-            x1,y1,x2,y2 = self._last_bbox
-            sx = 320 / f.shape[1]; sy = 180 / f.shape[0]
-            cv2.rectangle(thumb, (int(x1*sx),int(y1*sy)),(int(x2*sx),int(y2*sy)),(0,255,0),2)
-        fh, fw = main_frame.shape[:2]
-        main_frame[fh-190:fh-10, 10:330] = thumb
-        cv2.rectangle(main_frame,(10,fh-190),(330,fh-10),(0,220,0),1)
-        lbl = "VISUAL GUIDE" if self._visual_guide else ("RETURN" if self._returning else "GIMBAL CAM")
-        cv2.putText(main_frame, lbl,(10,fh-195),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,100),2)
-        return main_frame
-
-    # ═══════════════════════════════════════════════════════════════
-    # 內部方法
-    # ═══════════════════════════════════════════════════════════════
-
-    def _calc_visual_rc(self, bbox) -> list:
-        """
-        梯度探測降落控制器。
-        每輪依序探測 6 個方向（前/後/左/右/上/下），記錄各方向的平均偵測面積。
-        探測完成後往面積最大的方向移動。持續循環直到面積超過閾值降落。
-        丟失時懸停，不交回 RTH。
-        """
-        area = (bbox[2]-bbox[0])*(bbox[3]-bbox[1]) if bbox else 0
-
-        if area >= self.cfg["LAND_AREA_THRESH"]:
-            print(f"[Gimbal] 🛬 降落（area={area}）")
-            self.tello.land()
-            self._landed    = True
-            self._returning = False
-            return [0, 0, 0, 0]
-
-        now   = time.time()
-        spd   = self.cfg["PROBE_SPEED"]
-        psec  = self.cfg["PROBE_SEC"]
-        msec  = self.cfg["MOVE_SEC"]
-
-        # 探測方向順序：前/後/左/右/上/下
-        DIRS = [
-            ( 0,  spd, 0, 0, "前"),
-            ( 0, -spd, 0, 0, "後"),
-            (-spd, 0,  0, 0, "左"),
-            ( spd, 0,  0, 0, "右"),
-            ( 0,   0,  spd, 0, "上"),
-            ( 0,   0, -spd, 0, "下"),
-        ]
-
-        # 初始化探測狀態（只在第一次進入時建立）
-        if not hasattr(self, '_probe_phase'):
-            self._probe_phase   = 'probe'   # 'probe' | 'move'
-            self._probe_idx     = 0          # 目前探測哪個方向
-            self._probe_t       = now
-            self._probe_areas   = [0.0] * len(DIRS)  # 各方向累積面積
-            self._probe_counts  = [0]   * len(DIRS)  # 各方向樣本數
-            self._move_dir      = 0          # 執行移動的方向 index
-            self._move_t        = now
-
-        if self._probe_phase == 'probe':
-            elapsed = now - self._probe_t
-
-            if elapsed < psec:
-                # 還在探測此方向：累積面積樣本
-                if area > 0:
-                    i = self._probe_idx
-                    self._probe_areas[i]  += area
-                    self._probe_counts[i] += 1
-                rc = list(DIRS[self._probe_idx][:4])
-                return rc
-            else:
-                # 此方向探測結束，移到下一個
-                self._probe_idx += 1
-                self._probe_t    = now
-
-                if self._probe_idx < len(DIRS):
-                    # 繼續下一個方向
-                    return list(DIRS[self._probe_idx][:4])
-                else:
-                    # 全部探測完畢，選擇最佳方向
-                    avgs = [
-                        self._probe_areas[i] / max(self._probe_counts[i], 1)
-                        for i in range(len(DIRS))
-                    ]
-                    best = int(max(range(len(DIRS)), key=lambda i: avgs[i]))
-                    best_name = DIRS[best][4]
-                    print(f"[Gimbal] 探測完成，最佳方向={best_name}  面積={avgs[best]:.0f}")
-
-                    # 重設探測狀態
-                    self._probe_phase  = 'move'
-                    self._move_dir     = best
-                    self._move_t       = now
-                    self._probe_idx    = 0
-                    self._probe_areas  = [0.0] * len(DIRS)
-                    self._probe_counts = [0]   * len(DIRS)
-                    return list(DIRS[best][:4])
-
-        else:  # move phase
-            if now - self._move_t < msec:
-                return list(DIRS[self._move_dir][:4])
-            else:
-                # 移動結束，重新探測
-                self._probe_phase = 'probe'
-                self._probe_t     = now
-                return [0, 0, 0, 0]
-
-
-    def _send_angle(self, pan: float, tilt: float):
-        cmd = f"P{int(pan)},T{int(tilt)}\n"
-        with self._serial_lock:
-            if self._serial and self._serial.is_open:
-                try:
-                    self._serial.write(cmd.encode())
-                except Exception as e:
-                    print(f"[Gimbal] serial: {e}")
-
-    def _detect(self, frame) -> Optional[tuple]:
-        if self._model is None:
-            return None
-        try:
-            results = self._model(frame, verbose=False, device=0)[0]
-            best, best_area = None, self.cfg["DETECT_MIN_AREA"]
-            for box in results.boxes:
-                if float(box.conf) < drone_conf:
-                    continue
-                x1,y1,x2,y2 = map(int, box.xyxy[0])
-                area = (x2-x1)*(y2-y1)
-                if area > best_area:
-                    best_area, best = area, (x1,y1,x2,y2)
-            return best
-        except Exception as e:
-            print(f"[Gimbal] detect: {e}")
-            return None
-
-
-    def _open_camera(self):
-        self._cap = cv2.VideoCapture(self._cam_idx)
-        if self._cap.isOpened():
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  DRONE_FRAME_W)
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  DRONE_FRAME_H)
-            self._cap.set(cv2.CAP_PROP_FPS, 30)
-            print(f"[Gimbal] webcam index={self._cam_idx} 開啟成功")
-        else:
-            print(f"[Gimbal] ❌ webcam index={self._cam_idx} 無法開啟")
-            self._cap = None
-
-    def _open_serial(self):
-        try:
-            import serial as _serial
-            import serial.tools.list_ports as _ports
-            self._serial = _serial.Serial(self._port, self.cfg["SERIAL_BAUD"], timeout=1)
-            time.sleep(2)
-            self._serial.readline()  # 讀掉 READY
-            print(f"[Gimbal] ESP32 串口 {self._port} 連線成功")
-        except Exception as e:
-            print(f"[Gimbal] ❌ 串口失敗: {e}")
-            self._serial = None
-
-
+# ===================== 航向鎖定返航控制器 =====================
 class ReturnHomeController:
     """
     低電量自動返航降落控制器。
-    三階段：fly（直線飛回起飛點）→ hover（懸停 2 秒穩定）→ land（降落）
-
-    RC 座標推導（FlightTracker 軸映射確認）：
-      tracker.z += (-vgx)*dt, tracker.x += (-vgy)*dt
-      fb>0 => vgy 增 => tracker.x 減 => 往 -x 方向
-      lr>0 => vgx 增 => tracker.z 減 => 往 -z 方向
-      yaw=0 時到達 (dx,dz): fb = -(ndx*sin+ndz*cos), lr = -(ndx*cos-ndz*sin)
-
-    無超時：fly 階段飛到真正到達起飛點 ARRIVE_CM 以內才切換 hover。
+    航向鎖定版：機頭永遠朝向目的地，直線前進
     """
+    ARRIVE_CM = 5  # 距起飛點此距離(cm)視為到達
+    HOVER_SEC = 2.0  # 到達後懸停秒數
+    SPEED = 30  # 返航飛行速度
+    DESCEND_SPD = -10  # 下降速度
+    TARGET_H_CM = 50  # 開始下降的高度門檻
+    YAW_SPEED = 40  # 最大轉向速度
+
     def __init__(self, tello, tracker):
-        self.cfg = LOW_BATTERY_CONFIG
-        self.tello   = tello
+        self.tello = tello
         self.tracker = tracker
-        self._phase  = "idle"
-        self._t      = 0.0
+        self._phase = "idle"
+        self._t = 0.0
+        self._last_yaw_error = 0
+        self._yaw_integral = 0
 
     def start(self):
         """觸發返航"""
-        dx   = self.tracker.home[0] - self.tracker.x
-        dz   = self.tracker.home[2] - self.tracker.z
-        dist = math.sqrt(dx**2 + dz**2)
+        dx = self.tracker.home[0] - self.tracker.x
+        dz = self.tracker.home[2] - self.tracker.z
+        dist = math.sqrt(dx ** 2 + dz ** 2)
         print(f"[ReturnHome] 啟動：估計距離={dist:.0f}cm")
         self._phase = "fly"
-        self._t     = time.time()
+        self._t = time.time()
+        self._yaw_integral = 0
+
+    def _calculate_yaw_error(self, target_yaw):
+        """計算偏航誤差（-180 到 180 度）"""
+        error = target_yaw - self.tracker.yaw
+        while error > 180:
+            error -= 360
+        while error < -180:
+            error += 360
+        return error
 
     def get_rc(self) -> list:
-        """每幀呼叫，回傳 [lr, fb, ud, yaw]。無超時，飛到到達才切換。"""
+        """每幀呼叫，回傳 [lr, fb, ud, yaw]"""
         if self._phase == "idle":
             return [0, 0, 0, 0]
 
         elapsed = time.time() - self._t
 
+        # ------------------------------------------------------------
+        # 飛行階段：先轉向目的地，然後直線前進
+        # ------------------------------------------------------------
         if self._phase == "fly":
-            dx      = self.tracker.home[0] - self.tracker.x
-            dz      = self.tracker.home[2] - self.tracker.z
-            dist_cm = math.sqrt(dx**2 + dz**2)
+            # 計算到起飛點的向量
+            dx = self.tracker.home[0] - self.tracker.x
+            dz = self.tracker.home[2] - self.tracker.z
+            dist_cm = math.sqrt(dx ** 2 + dz ** 2)
 
-            if dist_cm > self.cfg["ARRIVE_CM"]:
-                total = max(dist_cm, 1.0)
-                ndx   = dx / total
-                ndz   = dz / total
-
-                # 世界座標 (ndx, ndz) → 機體 RC 指令
-                # 推導自 FlightTracker 軸映射（見 class docstring）
-                yaw_r = math.radians(self.tracker.yaw)
-                fb_v  = -int(self.cfg["SPEED"] * (
-                    ndx * math.sin(yaw_r) + ndz * math.cos(yaw_r)))
-                lr_v  = -int(self.cfg["SPEED"] * (
-                    ndx * math.cos(yaw_r) - ndz * math.sin(yaw_r)))
-
-                try:    cur_h = self.tello.get_height()
-                except: cur_h = 80
-                ud_v = self.cfg["DESCEND_SPD"] if cur_h > self.cfg["TARGET_H_CM"] else 0
-                return [lr_v, fb_v, ud_v, 0]
-            else:
-                print(f"[ReturnHome] 到達起飛點（dist={dist_cm:.0f}cm），懸停...")
+            # 到達檢查
+            if dist_cm <= self.ARRIVE_CM:
+                print(f"[ReturnHome] 到達起飛點附近 (dist={dist_cm:.0f}cm)，懸停...")
                 self._phase = "hover"
-                self._t     = time.time()
+                self._t = time.time()
                 return [0, 0, 0, 0]
 
+            # 計算目標偏航角（指向目的地）
+            if abs(dx) < 0.1 and abs(dz) < 0.1:
+                target_yaw = 0
+            else:
+                target_yaw = math.degrees(math.atan2(dx, dz))
+
+            # 計算偏航誤差
+            yaw_error = self._calculate_yaw_error(target_yaw)
+
+            # PID 控制偏航
+            # P 項
+            p_term = 0.8 * yaw_error
+
+            # I 項（防止靜態誤差）
+            self._yaw_integral += yaw_error * 0.01  # dt 約 0.01 秒
+            self._yaw_integral = max(-100, min(100, self._yaw_integral))  # 限制積分量
+            i_term = 0.05 * self._yaw_integral
+
+            # D 項（減少震盪）
+            d_term = 0.1 * (yaw_error - self._last_yaw_error)
+
+            # 計算偏航指令
+            yaw_cmd = int(p_term + i_term + d_term)
+            yaw_cmd = max(-self.YAW_SPEED, min(self.YAW_SPEED, yaw_cmd))
+
+            self._last_yaw_error = yaw_error
+
+            # --------------------------------------------------------
+            # 航向鎖定：只有當機頭接近目標方向時才前進
+            # --------------------------------------------------------
+            if abs(yaw_error) < 30:  # 誤差小於30度才前進
+                # 前進速度（距離越近越慢）
+                speed = min(self.SPEED, max(8, int(dist_cm / 8)))
+                fb_v = speed
+                lr_v = 0  # 不側移，只前進
+            else:
+                # 誤差太大時，先轉向不前進
+                fb_v = 0
+                lr_v = 0
+                if abs(yaw_error) > 10:  # 每幀都顯示轉向訊息
+                    print(f"[Return] 轉向中... 誤差={yaw_error:.0f}°, cmd={yaw_cmd}")
+
+            # 高度控制（緩慢下降）
+            try:
+                cur_h = self.tello.get_height()
+            except:
+                cur_h = 80
+
+            ud_v = self.DESCEND_SPD if cur_h > self.TARGET_H_CM else 0
+
+            # 調試輸出（每秒幾次）
+            if int(time.time() * 5) % 10 == 0:
+                print(f"[Return] dist={dist_cm:.0f}cm, yaw_err={yaw_error:.0f}°, "
+                      f"yaw_cmd={yaw_cmd}, fb={fb_v}, target_yaw={target_yaw:.0f}°")
+
+            return [lr_v, fb_v, ud_v, yaw_cmd]
+
+        # ------------------------------------------------------------
+        # 懸停階段：到達後穩定
+        # ------------------------------------------------------------
         elif self._phase == "hover":
-            if elapsed >= self.cfg["HOVER_SEC"]:
-                print("[ReturnHome] 降落")
+            if elapsed >= self.HOVER_SEC:
+                print("[ReturnHome] 懸停完成，開始降落")
                 self._phase = "land"
                 self.tello.land()
             return [0, 0, 0, 0]
 
+        # ------------------------------------------------------------
+        # 降落階段
+        # ------------------------------------------------------------
         else:  # land
             return [0, 0, 0, 0]
 
@@ -1416,8 +1080,7 @@ class ReturnHomeController:
     def phase(self) -> str:
         return self._phase
 
-
-# ===================== 主任務控制器 =====================
+# ===================== 主控制器 =====================
 class TelloMissionController:
     def __init__(self):
         self.tello = Tello()
@@ -1432,22 +1095,19 @@ class TelloMissionController:
         self.circle     = CircleScanner()
         self.qr_scanner = QRScanner()
 
-        # 飛行位置追蹤（Dead Reckoning）
+        # 飛行軌跡紀錄器（ReturnHomeController 需要）
         self.tracker = FlightTracker()
 
-        # 返航控制器 + 雲台 + webcam 視覺降落
+        # [v9] RViz UDP 橋接（選用，bridge_node.py 不開時靜默）
+        self.rviz_bridge  = RvizBridge()
         self.return_home  = ReturnHomeController(self.tello, self.tracker)
-        self.webcam_land  = WebcamLanding(self.tello, self.tracker)
-        self.gimbal       = GimbalTracker(self.tello, self.tracker)
         self._scanned_popup_until = 0.0  # popup 顯示到此時間戳
 
-        # 隨機高度控制
+        # [v9] 隨機高度控制
         self._alt_next_time = float("inf")  # 起飛前不觸發
         self._alt_ud_cmd    = 0              # 目前高度指令（+上/-下/0靜止）
 
-
-
-        # 電量監控
+        # [v3] 電量監控
         self._last_battery_check = 0.0
         self._low_battery_triggered = False
 
@@ -1503,7 +1163,6 @@ class TelloMissionController:
 
         if new_state == DroneState.RETURN_HOME:
             self.return_home.start()
-            self.gimbal.start_return()
         if new_state == DroneState.FORWARD:
             self.forward.start()
         elif new_state == DroneState.CIRCLE:
@@ -1541,7 +1200,7 @@ class TelloMissionController:
         return self._alt_ud_cmd
 
     def _check_battery(self):
-        """週期性電量檢查，低電量時切換回航"""
+        """[v3] 週期性電量檢查，低電量時切換回航"""
         now = time.time()
         if now - self._last_battery_check < LOW_BATTERY_CONFIG["CHECK_INTERVAL"]:
             return
@@ -1586,16 +1245,15 @@ class TelloMissionController:
 
                 frame = cv2.resize(frame, (FRAME_W, FRAME_H))
 
-                # 低電量檢查（週期性）
+                # [v3] 低電量檢查（週期性）
                 self._check_battery()
 
                 (manual_active, lr, fb, ud, yv,
                  quit_flag, force_state,
                  takeoff_cmd, land_cmd) = self.get_keyboard_control()
 
-                self.tracker.update(self.tello, is_manual=manual_active)
-                self.gimbal.update_tracking()
-                # ORB-SLAM3: send frame to WSL1, apply correction if available
+                # RViz 橋接：發送位置
+                self.rviz_bridge.send(self.tracker)
 
 
                 if quit_flag:
@@ -1617,7 +1275,6 @@ class TelloMissionController:
                     time.sleep(1)
                     time.sleep(1.5)   # 等起飛穩定
                     self.tracker.reset_pose()   # 重設位移/軌跡，起飛點固定不動
-                    self.gimbal.start_tracking()
                     # 起飛穩定後 5 秒才開始隨機高度變化
                     self._alt_next_time = time.time() + 5.0
                     self._alt_ud_cmd    = 0
@@ -1654,11 +1311,9 @@ class TelloMissionController:
                         )
                         cv2.imshow("Depth Map", depth_display)
 
-                        # 推送深度幀給點雲視窗
-                        pose = (self.tracker.x, self.tracker.y,
-                                self.tracker.z, self.tracker.yaw)
+                        # [v3] 推送深度幀給點雲視窗
 
-                        # conf 提高至 0.75
+                        # [Fix 1] conf 提高至 0.75
                         results = self.forward.model(frame, conf=box_conf, verbose=False)
                         if results[0].boxes is not None and len(results[0].boxes) > 0:
                             boxes = results[0].boxes
@@ -1789,25 +1444,9 @@ class TelloMissionController:
                                 self.change_state(DroneState.MIDAS)
 
 
-                    # ── RETURN_HOME 返航 ──────────────────────────────────
+                    # ── RETURN_HOME 低電量直線返航 ──────────────────────
                     if self.current_state == DroneState.RETURN_HOME:
-                        if self.webcam_land.is_active():
-                            control_cmd = self.webcam_land.get_rc()
-                            frame = self.webcam_land.draw_hud(frame)
-                            if self.webcam_land.is_landing():
-                                self.change_state(DroneState.MIDAS)
-                        else:
-                            rc_gimbal = self.gimbal.get_return_rc()
-                            if rc_gimbal is not None:
-                                # 梯度探測：rc_gimbal 包含完整指令
-                                control_cmd = rc_gimbal
-                                frame = self.gimbal.draw_hud(frame)
-                                if self.gimbal.is_landing():
-                                    self.change_state(DroneState.MIDAS)
-                            else:
-                                control_cmd = self.return_home.get_rc()
-                                if self.webcam_land.should_handoff():
-                                    self.webcam_land.start()
+                        control_cmd = self.return_home.get_rc()
 
                     current_time = time.time()
                     if current_time - last_control_time >= CONTROL_INTERVAL:
@@ -1818,7 +1457,6 @@ class TelloMissionController:
                     self.tello.send_rc_control(lr, fb, ud, yv)
                     cv2.putText(frame, "MANUAL MODE", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
 
                 cv2.putText(frame, f"State: {self.current_state}",
                             (10, FRAME_H-60),
@@ -1856,19 +1494,17 @@ class TelloMissionController:
 
     def cleanup(self):
         print("\n🧹 清理資源中...")
+        self.rviz_bridge.close()
         self.tello.send_rc_control(0, 0, 0, 0)
         time.sleep(0.5)
         print("⚠️  請記得手動降落")
-
-        # 儲存軌跡、關閉點雲視窗
-        self.tracker.save_path_csv()
 
         self.tello.streamoff()
         pygame.quit()
         cv2.destroyAllWindows()
         print("✅ 程式結束")
 
-# ===================== 程式進入點 =====================
+# ===================== 程式入口 =====================
 if __name__ == "__main__":
     controller = TelloMissionController()
     controller.run()

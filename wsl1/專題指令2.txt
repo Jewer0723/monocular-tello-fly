@@ -34,6 +34,7 @@ rviz -d ~/tello_bridge/tello_rviz.rviz
 先啟動main_fly再執行下面wsl1指令
 
 ~/tello_bridge/start_tello_orb.sh
+~/tello_bridge/start_tello.sh
 
 /*****************************************************************************************/
 
