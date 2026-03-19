@@ -11,23 +11,23 @@ Tello 四階段任務控制系統（優化版 v5）
          放棄不可靠的位置估算，純視覺回航
 """
 
-import csv
-import json
-import math
-import os
-import socket
-import time
-from collections import deque
-from datetime import datetime
-
+import torch
 import cv2
 import numpy as np
-import pygame
-import torch
 from djitellopy import Tello
-from pyzbar import pyzbar
-from typing import List
+import time
+import pygame
+from collections import deque
 from ultralytics import YOLO
+from pyzbar import pyzbar
+import csv
+import os
+import math
+import threading
+from datetime import datetime
+import json
+import socket
+
 
 # ===================== 全局配置 =====================
 FRAME_W, FRAME_H = 640, 480
@@ -109,13 +109,28 @@ QR_SCAN_CONFIG = {
 
 # ===================== [v3] 低電量回航參數 =====================
 LOW_BATTERY_CONFIG = {
-    "THRESHOLD":          50,   # 低於此電量(%)觸發回航
+    "THRESHOLD":          30,   # 低於此電量(%)觸發回航
     "CHECK_INTERVAL":   5,     # 每幾秒查一次電量
     "RETURN_SPEED":       20,   # 回航飛行速度
     "YAW_KP":            0.8,   # 偏航修正係數
     "WAYPOINT_RADIUS":    60,   # 中繼航點到達容忍半徑(cm)
     "LAND_RADIUS":        20,   # 起飛點降落容忍半徑(cm)
 }
+
+
+# ===================== [v3] 偽點雲參數（MiDaS 反投影）=====================
+POINTCLOUD_CONFIG = {
+    "UPDATE_INTERVAL":  0.5,   # 點雲更新間隔(秒)
+    "MAX_POINTS":      8000,   # 最多保留點數
+    "DOWNSAMPLE_STEP":    8,   # 深度圖取樣步長
+    # Tello 相機近似內參（FOV≈82.6°, 640×480）
+    "FX":             458.0,
+    "FY":             458.0,
+    "CX":             320.0,
+    "CY":             240.0,
+    "DEPTH_SCALE":      3.0,   # 相對深度縮放倍率（調整視覺密度感）
+}
+
 
 # ===================== [v9] RViz UDP 橋接發布器 =====================
 class RvizBridge:
@@ -184,7 +199,7 @@ class FlightTracker:
         self.y   = 0.0
         self.z   = 0.0
         self.yaw = 0.0
-        self.path: List[tuple] = [(0.0, 0.0, 0.0, False)]
+        self.path: list[tuple] = [(0.0, 0.0, 0.0, False)]
         self.last_time = time.time()
         self.home      = (0.0, 0.0, 0.0)   # 起飛點（固定，不再被覆寫）
 
@@ -1251,6 +1266,9 @@ class TelloMissionController:
                 (manual_active, lr, fb, ud, yv,
                  quit_flag, force_state,
                  takeoff_cmd, land_cmd) = self.get_keyboard_control()
+
+                # 更新飛行軌跡（航位推算）
+                self.tracker.update(self.tello, is_manual=manual_active)
 
                 # RViz 橋接：發送位置
                 self.rviz_bridge.send(self.tracker)
