@@ -19,7 +19,6 @@ import socket
 import time
 from collections import deque
 from datetime import datetime
-from typing import List
 
 import cv2
 import numpy as np
@@ -27,6 +26,7 @@ import pygame
 import torch
 from djitellopy import Tello
 from pyzbar import pyzbar
+from typing import List
 from ultralytics import YOLO
 
 # ===================== 全局配置 =====================
@@ -113,8 +113,8 @@ LOW_BATTERY_CONFIG = {
     "CHECK_INTERVAL":   5,     # 每幾秒查一次電量
     "RETURN_SPEED":       20,   # 回航飛行速度
     "YAW_KP":            0.8,   # 偏航修正係數
-    "WAYPOINT_RADIUS":    60,   # 中繼航點到達容忍半徑(cm)
-    "LAND_RADIUS":        20,   # 起飛點降落容忍半徑(cm)
+    "WAYPOINT_RADIUS":    5,   # 中繼航點到達容忍半徑(cm)
+    "LAND_RADIUS":        5,   # 起飛點降落容忍半徑(cm)
 }
 
 # ===================== [v9] RViz UDP 橋接發布器 =====================
@@ -145,11 +145,18 @@ class RvizBridge:
         self._last_t = now
         try:
             returning = getattr(self, '_returning', False)
-            # 回航時座標乘上倍數，讓 rviz 軌跡移動更明顯（不影響飛行）
-            RETURN_SCALE = 3.0 if returning else 1.0
+            # 回航時：以 home 為基準放大位移，讓 rviz 上移動更明顯
+            # 實際飛行完全依賴 tracker.x/z，這裡只影響視覺顯示
+            RETURN_VIS_SCALE = 5.0
+            if returning:
+                # 放大相對起飛點的位移向量
+                vis_x = tracker.home[0] + (tracker.x - tracker.home[0]) * RETURN_VIS_SCALE
+                vis_z = tracker.home[2] + (tracker.z - tracker.home[2]) * RETURN_VIS_SCALE
+            else:
+                vis_x, vis_z = tracker.x, tracker.z
             payload = json.dumps({
-                "x":        round(tracker.x   * RETURN_SCALE, 1),
-                "z":        round(tracker.z   * RETURN_SCALE, 1),
+                "x":        round(vis_x,       1),
+                "z":        round(vis_z,       1),
                 "yaw":      round(tracker.yaw, 1),
                 "home":     [tracker.home[0], tracker.home[2]],
                 "returning": returning,
@@ -942,7 +949,7 @@ class ReturnHomeController:
     低電量自動返航降落控制器。
     航向鎖定版：機頭永遠朝向目的地，直線前進
     """
-    ARRIVE_CM = 5  # 距起飛點此距離(cm)視為到達
+    ARRIVE_CM = 5  # 距起飛點此距離(cm)視為到達（積分誤差容忍）
     HOVER_SEC = 2.0  # 到達後懸停秒數
     SPEED = 30  # 返航飛行速度
     DESCEND_SPD = -10  # 下降速度
