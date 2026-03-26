@@ -153,7 +153,22 @@ class RvizBridge:
                 vis_x = tracker.home[0] + (tracker.x - tracker.home[0]) * RETURN_VIS_SCALE
                 vis_z = tracker.home[2] + (tracker.z - tracker.home[2]) * RETURN_VIS_SCALE
             else:
-                vis_x, vis_z = tracker.x, tracker.z
+                # 一般飛行：低速時同樣放大，讓 rviz 軌跡更清楚
+                SLOW_VIS_SCALE = 4.0
+                SLOW_THRESH    = 8.0
+                spd = math.sqrt(tracker.x**2 + tracker.z**2)  # 粗估（非精確速度）
+                # 改用 path 最後兩點距離估算速度
+                if len(tracker.path) >= 2:
+                    p1, p2 = tracker.path[-2], tracker.path[-1]
+                    move = math.sqrt((p2[0]-p1[0])**2+(p2[2]-p1[2])**2)
+                    if move > 0 and move < SLOW_THRESH * 0.1:
+                        s = SLOW_VIS_SCALE
+                    else:
+                        s = 1.0
+                else:
+                    s = 1.0
+                vis_x = tracker.home[0] + (tracker.x - tracker.home[0]) * s
+                vis_z = tracker.home[2] + (tracker.z - tracker.home[2]) * s
             payload = json.dumps({
                 "x":        round(vis_x,       1),
                 "z":        round(vis_z,       1),
@@ -231,7 +246,18 @@ class FlightTracker:
         self.x += (-vy_body) * dt
         self.y +=   vz_body  * dt
 
-        self.path.append((self.x, self.y, self.z, is_manual))
+        # 低速放大：RC 速度小時位移量很小，path 記錄點放大讓軌跡可見
+        # 只影響 path（rviz / minimap 顯示），不影響 x/z 飛行計算
+        SLOW_THRESH = 10.0   # cm/s，低於此視為低速
+        VIS_SCALE   = 4.0   # 低速時放大倍數
+        h_speed = math.sqrt(vx_body**2 + vy_body**2)
+        if h_speed > 0 and h_speed < SLOW_THRESH:
+            scale = VIS_SCALE
+        else:
+            scale = 1.0
+        vis_x = self.home[0] + (self.x - self.home[0]) * scale
+        vis_z = self.home[2] + (self.z - self.home[2]) * scale
+        self.path.append((vis_x, self.y, vis_z, is_manual))
 
     def get_yaw_to_point(self, tx: float, tz: float) -> float:
         """
@@ -968,7 +994,7 @@ class ReturnHomeController:
         """觸發返航"""
         dx = self.tracker.home[0] - self.tracker.x
         dz = self.tracker.home[2] - self.tracker.z
-        dist = math.sqrt(dx ** 2 + dz ** 2) * 2
+        dist = math.sqrt(dx ** 2 + dz ** 2)
         print(f"[ReturnHome] 啟動：估計距離={dist:.0f}cm")
         self._phase = "fly"
         self._t = time.time()
@@ -997,7 +1023,7 @@ class ReturnHomeController:
             # 計算到起飛點的向量
             dx = self.tracker.home[0] - self.tracker.x
             dz = self.tracker.home[2] - self.tracker.z
-            dist_cm = math.sqrt(dx ** 2 + dz ** 2) * 2
+            dist_cm = math.sqrt(dx ** 2 + dz ** 2)
 
             # 到達檢查
             if dist_cm <= self.ARRIVE_CM:
