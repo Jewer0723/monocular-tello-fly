@@ -109,7 +109,7 @@ QR_SCAN_CONFIG = {
 
 # ===================== [v3] 低電量回航參數 =====================
 LOW_BATTERY_CONFIG = {
-    "THRESHOLD":          50,   # 低於此電量(%)觸發回航
+    "THRESHOLD":          30,   # 低於此電量(%)觸發回航
     "CHECK_INTERVAL":   5,     # 每幾秒查一次電量
     "RETURN_SPEED":       20,   # 回航飛行速度
     "YAW_KP":            0.8,   # 偏航修正係數
@@ -949,9 +949,9 @@ class ReturnHomeController:
     低電量自動返航降落控制器。
     航向鎖定版：機頭永遠朝向目的地，直線前進
     """
-    ARRIVE_CM = 10  # 距起飛點此距離(cm)視為到達（積分誤差容忍）
+    ARRIVE_CM = 80  # 距起飛點此距離(cm)視為到達（積分誤差容忍）
     HOVER_SEC = 2.0  # 到達後懸停秒數
-    SPEED = 30  # 返航飛行速度
+    SPEED = 50  # 返航飛行速度
     DESCEND_SPD = -10  # 下降速度
     TARGET_H_CM = 50  # 開始下降的高度門檻
     YAW_SPEED = 40  # 最大轉向速度

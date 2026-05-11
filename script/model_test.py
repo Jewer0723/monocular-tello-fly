@@ -3,7 +3,7 @@ from djitellopy import Tello
 from ultralytics import YOLO
 
 # 1. 載入模型
-model = YOLO('../model/barcode1.pt')
+model = YOLO('../model/box4.pt')
 
 # 2. 自動獲取指定類別的 ID (對應模型內部的索引)
 target_names = ['cardboard box', 'barcode', 'qr code']

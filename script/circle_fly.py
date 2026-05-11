@@ -31,7 +31,7 @@ def clamp(val, minv, maxv):
 # 初始化
 # ======================
 
-model = YOLO("../model/box1.pt")
+model = YOLO("../model/box4.pt")
 
 tello = Tello()
 tello.connect()
