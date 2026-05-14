@@ -1,5 +1,5 @@
 """
-main_fly9.4.py  –  Tello 雙模式任務控制系統
+main_fly9.4.py  –  Tello 雙模式任務控制系統 (修復起飛衝突版)
 =============================================
 功能 1（Mode 1）: 環繞巡檢  — MIDAS巡航 → FORWARD接近 → CIRCLE環繞 → QR_SCAN掃碼
 功能 2（Mode 2）: 走道巡檢  — 起飛爬升 → roll左掃描QR(5個) → MiDaS判定靠近對向面板
@@ -7,16 +7,10 @@ main_fly9.4.py  –  Tello 雙模式任務控制系統
 切換方式: mission_command.yaml 的 mission.mode 設 1/2/auto，
           或飛行中按鍵盤 F1(Mode1) / F2(Mode2) 手動切換。
 
-掃描偏移改用 roll（左右平移）而非 yaw（原地旋轉），以貼近貨架側飛。
-所有任務參數由 mission_command.yaml 讀取，不寫死在代碼中。
-
 修改紀錄:
-  [9.4-A] 新增 MissionLoader：從 YAML 讀取所有配置
-  [9.4-B] 新增 Mode 2：走道巡檢狀態機
-  [9.4-C] roll 取代 yaw 做掃描偏移
-  [9.4-D] MiDaS 判定面板距離（不再用固定計時）
-  [9.4-E] 走道切換自動繞行
-  [9.4-F] 鍵盤 F1/F2 手動切換模式
+  [9.4-A~F] 新增 Mode 2 走道巡檢、YAML 讀取、roll 平移掃描等
+  [9.4-Fix2] 新增 is_flying 飛行鎖定，避免地面待機時 AisleInspector 
+             狂送爬升 RC 指令導致與 takeoff 指令衝突卡死。
 """
 
 import csv
@@ -29,6 +23,7 @@ import time
 from collections import deque
 from datetime import datetime
 from typing import List, Dict, Any
+import threading
 
 import cv2
 import numpy as np
@@ -201,34 +196,6 @@ class FlightTracker:
 
     def distance_to_home(self) -> float:
         return math.sqrt((self.x - self.home[0])**2 + (self.z - self.home[2])**2)
-
-    def draw_minimap(self, frame, size=160, margin=10):
-        h, w = frame.shape[:2]
-        x0, y0 = w - size - margin, margin
-        cv2.rectangle(frame, (x0, y0), (x0+size, y0+size), (30, 30, 30), -1)
-        cv2.rectangle(frame, (x0, y0), (x0+size, y0+size), (100, 100, 100), 1)
-        if len(self.path) < 2:
-            return frame
-        xs   = [p[0] for p in self.path]
-        zs   = [p[2] for p in self.path]
-        span = max(max(xs)-min(xs), max(zs)-min(zs), 100)
-        scale = (size - 20) / span
-        cx_map, cy_map = x0 + size//2, y0 + size//2
-        ox = (max(xs)+min(xs))/2
-        oz = (max(zs)+min(zs))/2
-        def to_px(px, pz):
-            return (int(cx_map+(px-ox)*scale), int(cy_map-(pz-oz)*scale))
-        for i in range(1, len(self.path)):
-            p1 = to_px(self.path[i-1][0], self.path[i-1][2])
-            p2 = to_px(self.path[i][0],   self.path[i][2])
-            is_man = len(self.path[i]) > 3 and self.path[i][3]
-            cv2.line(frame, p1, p2, (0,140,255) if is_man else (0,200,255), 1)
-        cv2.circle(frame, to_px(self.home[0], self.home[2]), 5, (0,255,0), -1)
-        cv2.circle(frame, to_px(self.x, self.z), 5, (0,0,255), -1)
-        dist = self.distance_to_home()
-        cv2.putText(frame, f"HOME:{dist:.0f}cm", (x0+2, y0+size-4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200,200,200), 1)
-        return frame
 
     def save_path_csv(self, filename="flight_path.csv"):
         with open(filename, "w", newline="") as f:
@@ -967,6 +934,10 @@ class TelloMissionController:
         self.state_start_t   = time.time()
         self.manual_mode     = False
         self.running         = True
+        
+        # 🟢 新增安全鎖：確保只在成功起飛後才發送自動 RC 指令
+        self.is_flying       = False   
+        
         self._scanned_popup  = 0.0
 
         # 電量監控
@@ -980,6 +951,10 @@ class TelloMissionController:
         pygame.init()
         pygame.display.set_mode((300, 200))
         pygame.display.set_caption("Tello Mission Control v9.4")
+
+        # 邊緣偵測：避免長按 T/L 鍵重複觸發
+        self._prev_t_key = False
+        self._prev_l_key = False
 
     # ── 鍵盤控制 ──────────────────────────────────────────
     def get_keyboard_control(self):
@@ -1014,7 +989,9 @@ class TelloMissionController:
         if keys[pygame.K_4]:  force_state = DroneState.QR_SCAN
 
         return (manual_active, lr, fb, ud, yv,
-                quit_flag, force_state, takeoff_cmd, land_cmd, switch_mode)
+                quit_flag, force_state,
+                bool(keys[pygame.K_t]), bool(keys[pygame.K_l]),
+                switch_mode)
 
     def change_state(self, new_state, qr_bbox=None):
         old = self.current_state
@@ -1079,8 +1056,14 @@ class TelloMissionController:
                 self._check_battery()
 
                 (manual_active, lr, fb, ud, yv,
-                 quit_flag, force_state, takeoff_cmd, land_cmd,
+                 quit_flag, force_state, t_held, l_held,
                  switch_mode) = self.get_keyboard_control()
+
+                # 邊緣偵測：只在「剛按下」那一幀觸發，避免長按重複起飛/降落
+                takeoff_cmd = t_held and not self._prev_t_key
+                land_cmd    = l_held and not self._prev_l_key
+                self._prev_t_key = t_held
+                self._prev_l_key = l_held
 
                 self.tracker.update(self.tello, is_manual=manual_active)
                 self.rviz_bridge.send(self.tracker)
@@ -1089,26 +1072,35 @@ class TelloMissionController:
                     print("使用者中斷")
                     break
 
-                if takeoff_cmd:
-                    print("🛸 起飛")
+                # ── 起飛指令 (保護機制：地面狀態才能起飛) ──
+                if takeoff_cmd and not self.is_flying:
+                    print("🛸 手動起飛...")
                     try:
                         self.tello.takeoff()
-                        time.sleep(CFG.get("takeoff","stabilize_wait_sec",default=2.5))
-                        self.tracker.reset_pose()
-                        self._alt_next_t = time.time() + 5.0
-                        self._alt_ud_cmd = 0
-                        if self.mission_mode == MissionMode.MODE2:
-                            self.inspector.reset()
-                            self.current_state = DroneState.CLIMB
-                        else:
-                            self.current_state = DroneState.MIDAS
+                        self.is_flying = True  # 起飛成功才解除鎖定
                     except Exception as e:
                         print(f"❌ 起飛失敗: {e}")
-                    continue
+                        continue
+                    
+                    stab = CFG.get("takeoff", "stabilize_wait_sec", default=2.5)
+                    print(f"⏳ 等待起飛穩定 {stab} 秒...")
+                    time.sleep(stab)
+                    
+                    self.tracker.reset_pose()
+                    self._alt_next_t = time.time() + 5.0
+                    self._alt_ud_cmd = 0
+                    if self.mission_mode == MissionMode.MODE2:
+                        self.inspector.reset()
+                        self.current_state = DroneState.CLIMB
+                    else:
+                        self.current_state = DroneState.MIDAS
+                    print("✅ 起飛完成，正式進入自動巡邏")
 
-                if land_cmd:
+                # ── 降落指令 (保護機制：飛行狀態才能手動降落) ──
+                if land_cmd and self.is_flying:
                     self._alt_ud_cmd = 0
                     self._alt_next_t = float("inf")
+                    self.is_flying = False     # 將狀態鎖死，停止 RC 發送
                     self.tello.send_rc_control(0,0,0,0)
                     time.sleep(0.3)
                     self.tello.land()
@@ -1127,36 +1119,43 @@ class TelloMissionController:
                     self.change_state(force_state)
 
                 # ────────────────────────────────────────
-                #  自動控制
+                #  自動/手動控制 (安全鎖：僅在 is_flying=True 時送出 RC 指令)
                 # ────────────────────────────────────────
-                if not manual_active:
-                    control_cmd = [0, 0, 0, 0]
+                if self.is_flying:
+                    if not manual_active:
+                        control_cmd = [0, 0, 0, 0]
 
-                    # ── Mode 1：環繞巡檢 ────────────────
-                    if self.mission_mode == MissionMode.MODE1:
-                        control_cmd = self._run_mode1(frame)
+                        # ── Mode 1：環繞巡檢 ────────────────
+                        if self.mission_mode == MissionMode.MODE1:
+                            control_cmd = self._run_mode1(frame)
 
-                    # ── Mode 2：走道巡檢 ────────────────
-                    elif self.mission_mode == MissionMode.MODE2:
-                        control_cmd, frame = self._run_mode2(frame)
+                        # ── Mode 2：走道巡檢 ────────────────
+                        elif self.mission_mode == MissionMode.MODE2:
+                            control_cmd, frame = self._run_mode2(frame)
 
-                    # ── 低電量回航（最高優先）────────────
-                    if self.current_state == DroneState.RETURN_HOME:
-                        control_cmd = self.return_home.get_rc()
-                        self.rviz_bridge.set_returning(True)
+                        # ── 低電量/完成任務 回航 ────────────
+                        if self.current_state == DroneState.RETURN_HOME:
+                            control_cmd = self.return_home.get_rc()
+                            self.rviz_bridge.set_returning(True)
+                            # 如果自動降落程序已啟動，將飛行狀態解除
+                            if self.return_home.is_landing():
+                                self.is_flying = False
 
-                    now = time.time()
-                    if now - last_ctrl_t >= CONTROL_INTERVAL:
-                        self.tello.send_rc_control(*control_cmd)
-                        last_ctrl_t = now
+                        now = time.time()
+                        if now - last_ctrl_t >= CONTROL_INTERVAL:
+                            self.tello.send_rc_control(*control_cmd)
+                            last_ctrl_t = now
 
+                    else:
+                        self.tello.send_rc_control(lr, fb, ud, yv)
+                        cv2.putText(frame, "MANUAL MODE", (10,30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
                 else:
-                    self.tello.send_rc_control(lr, fb, ud, yv)
-                    cv2.putText(frame, "MANUAL MODE", (10,30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                    # 地面待機狀態 (不送任何 RC 指令)
+                    cv2.putText(frame, "STANDBY (Press T to Takeoff)", (10,30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
 
                 # ── HUD ────────────────────────────────
-                self.tracker.draw_minimap(frame)
                 cv2.putText(frame,
                     f"State:{self.current_state}  Mode:{'1-Circle' if self.mission_mode==1 else '2-Aisle'}",
                     (10, FRAME_H-60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2)
