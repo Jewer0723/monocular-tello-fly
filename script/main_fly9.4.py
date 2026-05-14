@@ -965,7 +965,7 @@ class TelloMissionController:
 
         pygame.event.pump()
         keys = pygame.key.get_pressed()
-        SPD  = 50
+        SPD  = 5
 
         if keys[pygame.K_w]:      ud = SPD;   manual_active = True
         if keys[pygame.K_s]:      ud = -SPD;  manual_active = True
