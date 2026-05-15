@@ -934,10 +934,10 @@ class TelloMissionController:
         self.state_start_t   = time.time()
         self.manual_mode     = False
         self.running         = True
-        
+
         # 🟢 新增安全鎖：確保只在成功起飛後才發送自動 RC 指令
-        self.is_flying       = False   
-        
+        self.is_flying       = False
+
         self._scanned_popup  = 0.0
 
         # 電量監控
@@ -987,6 +987,7 @@ class TelloMissionController:
         if keys[pygame.K_2]:  force_state = DroneState.FORWARD
         if keys[pygame.K_3]:  force_state = DroneState.CIRCLE
         if keys[pygame.K_4]:  force_state = DroneState.QR_SCAN
+        if keys[pygame.K_5]:  force_state = DroneState.RETURN_HOME
 
         return (manual_active, lr, fb, ud, yv,
                 quit_flag, force_state,
@@ -1081,11 +1082,11 @@ class TelloMissionController:
                     except Exception as e:
                         print(f"❌ 起飛失敗: {e}")
                         continue
-                    
+
                     stab = CFG.get("takeoff", "stabilize_wait_sec", default=2.5)
                     print(f"⏳ 等待起飛穩定 {stab} 秒...")
                     time.sleep(stab)
-                    
+
                     self.tracker.reset_pose()
                     self._alt_next_t = time.time() + 5.0
                     self._alt_ud_cmd = 0
