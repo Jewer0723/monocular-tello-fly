@@ -42,6 +42,11 @@ inspection:
   # 掃描方向反轉前的等待時間(秒)
   rescan_wait_sec: 1.5
 
+  # ── 面板轉向與靠近設定 ─────────────────────────────────
+  # 出發面掃完後，原地轉 180 度的速度與時間
+  turn_180_yaw_speed: 50
+  turn_180_duration_sec: 2.1
+  
   # 靠近面板判定：MiDaS 深度閾值（越大=越近）
   panel_approach_depth: 0.55
 
@@ -55,21 +60,21 @@ inspection:
     # speed: RC 速度值（0~100）
     # duration_sec: 持續時間；0 = 用 midas_clear 判定（前方無障礙物才停）
     steps:
-      - action: roll_left          # 繼續左偏航直到前方無障礙
+      - action: roll_left          # 1. 向左飄直到無障礙物
         speed: 15
         duration_sec: 0            # 0 = 用 MiDaS 判定
         midas_clear_threshold: 0.20
 
-      - action: yaw_right          # 右轉 90 度
+      - action: yaw_right          # 2. 向右轉 90 度
         speed: 40
         duration_sec: 1.2
 
-      - action: obstacle_forward   # 開避障前進直到前方無障礙
-        speed: 18
-        duration_sec: 0
+      - action: roll_left          # 3. 向左飄直到無障礙物（取代原本的前進避障）
+        speed: 15
+        duration_sec: 0            # 0 = 用 MiDaS 判定
         midas_clear_threshold: 0.20
 
-      - action: yaw_right          # 再右轉 90 度（現在面向第二走道）
+      - action: yaw_right          # 4. 再右轉 90 度（完成後將面向並繼續掃描第二走道）
         speed: 40
         duration_sec: 1.2
 

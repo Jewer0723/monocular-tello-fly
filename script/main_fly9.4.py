@@ -1,16 +1,16 @@
 """
-main_fly9.4.py  –  Tello 雙模式任務控制系統 (修復起飛衝突版)
+main_fly9.4.py  –  Tello 雙模式任務控制系統 (修復起飛衝突與轉向邏輯版)
 =============================================
 功能 1（Mode 1）: 環繞巡檢  — MIDAS巡航 → FORWARD接近 → CIRCLE環繞 → QR_SCAN掃碼
-功能 2（Mode 2）: 走道巡檢  — 起飛爬升 → roll左掃描QR(5個) → MiDaS判定靠近對向面板
+功能 2（Mode 2）: 走道巡檢  — 起飛爬升 → roll左掃描QR(5個) → 原地轉180度 → MiDaS判定靠近對向面板
                              → 繼續roll左掃描(5個) → 繞到第二走道 → 重複 → 回航降落
 切換方式: mission_command.yaml 的 mission.mode 設 1/2/auto，
           或飛行中按鍵盤 F1(Mode1) / F2(Mode2) 手動切換。
 
 修改紀錄:
   [9.4-A~F] 新增 Mode 2 走道巡檢、YAML 讀取、roll 平移掃描等
-  [9.4-Fix2] 新增 is_flying 飛行鎖定，避免地面待機時 AisleInspector 
-             狂送爬升 RC 指令導致與 takeoff 指令衝突卡死。
+  [9.4-Fix2] 新增 is_flying 飛行鎖定，避免起飛指令衝突。
+  [9.4-Fix3] 修復對向面板掃描邏輯，加入 TURN_AROUND_180 狀態，先轉向再前進靠近。
 """
 
 import csv
@@ -23,7 +23,6 @@ import time
 from collections import deque
 from datetime import datetime
 from typing import List, Dict, Any
-import threading
 
 import cv2
 import numpy as np
@@ -110,6 +109,7 @@ class DroneState:
     # Mode 2（走道巡檢）
     CLIMB        = "CLIMB"           # 起飛後爬升到巡邏高度
     AISLE_SCAN   = "AISLE_SCAN"      # roll左掃QR
+    TURN_AROUND_180 = "TURN_AROUND_180" # 原地轉180度
     APPROACH     = "APPROACH"        # MiDaS靠近對向面板
     AISLE2_SCAN  = "AISLE2_SCAN"     # 對向面板掃QR
     AISLE_CHANGE = "AISLE_CHANGE"    # 繞行到另一條走道
@@ -634,6 +634,11 @@ class AisleInspector:
         self._roll_l  = INSP_CFG.get("roll_scan_speed",   -12)
         self._roll_r  = INSP_CFG.get("roll_rescan_speed",  12)
         self._rescan_wait = INSP_CFG.get("rescan_wait_sec", 1.5)
+        
+        # 轉向 180 度配置
+        self._turn_180_yaw = INSP_CFG.get("turn_180_yaw_speed", 50)
+        self._turn_180_duration = INSP_CFG.get("turn_180_duration_sec", 2.1)
+        
         self._panel_depth = INSP_CFG.get("panel_approach_depth", 0.55)
         self._panel_roll  = INSP_CFG.get("panel_roll_speed", -10)
 
@@ -722,10 +727,21 @@ class AisleInspector:
                 self.qr_scanner.start()
             status = "RESCAN_RIGHT"
 
-        # ── 靠近對向面板（MiDaS 判定）────────────────────
+        # ── 轉向 180 度 ──────────────────────────────────
+        elif self._state == "TURN_AROUND_180":
+            yaw = self._turn_180_yaw
+            
+            if time.time() - self._step_t >= self._turn_180_duration:
+                print("🔄 180 度轉向完成，開始向前靠近對向面板")
+                self._state = "APPROACH_PANEL"
+                yaw = 0
+            status = "TURN_AROUND_180"
+
+        # ── 轉向後，向前靠近對向面板（MiDaS 判定）─────────
         elif self._state == "APPROACH_PANEL":
             fb  = MIDAS_CFG.get("base_forward_speed", 20)
             lr  = 0
+            
             if center_depth >= self._panel_depth:
                 print(f"🏗️ 靠近對向面板 depth={center_depth:.3f}，開始掃對向")
                 self._face     = 2
@@ -762,8 +778,9 @@ class AisleInspector:
 
     def _handle_side_complete(self):
         if self._face == 1:
-            print(f"✅ 走道{self._aisle_no}出發面掃完，靠近對向面板")
-            self._state = "APPROACH_PANEL"
+            print(f"✅ 走道{self._aisle_no}出發面掃完，準備轉向 180 度")
+            self._state  = "TURN_AROUND_180"
+            self._step_t = time.time()  # 記錄轉向開始時間
         else:
             if self._aisle_no == 1:
                 print("✅ 走道1兩面掃完，開始繞到走道2")
