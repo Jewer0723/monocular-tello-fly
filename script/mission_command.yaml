@@ -25,7 +25,7 @@ mission:
 
 # ── 起飛設定 ──────────────────────────────────────────────
 takeoff:
-  cruise_altitude_cm: 120        # 起飛後爬升到此高度開始巡邏
+  cruise_altitude_cm: 135       # 起飛後爬升到此高度開始巡邏
   stabilize_wait_sec: 2.5        # 起飛後等待穩定時間
 
 # ── 走道巡檢任務（Mode 2）─────────────────────────────────
@@ -151,7 +151,7 @@ return_home:
   descend_speed:       -10
   target_height_cm:    50
   yaw_speed:           40
-  return_altitude_cm:  150     # 回航前先爬升到此高度（Mode 2 巡檢完成後）
+  return_altitude_cm:  220     # 回航前先爬升到此高度（Mode 2 巡檢完成後）
 
 # ── RViz UDP 橋接 ─────────────────────────────────────────
 rviz_bridge:
