@@ -1,84 +1,66 @@
 # ============================================================
 #  mission_command.yaml  –  Tello 巡檢任務指令配置
-#  main_fly9.4 啟動時讀取此檔，無需修改主程式
 # ============================================================
 
-# ── 全域影像設定 ──────────────────────────────────────────
 frame:
   width: 640
   height: 480
-  control_interval: 0.05       # 控制頻率(秒)
+  control_interval: 0.05
 
-# ── 模型設定 ──────────────────────────────────────────────
 models:
   box_model_path:     "../model/box2.pt"
   barcode_model_path: "../model/barcode1.pt"
   box_conf:  0.70
   qr_conf:   0.70
 
-# ── 任務模式選擇 ──────────────────────────────────────────
-# mode: 1 = 環繞巡檢（原功能）
-#       2 = 走道巡檢（新功能：掃 QR Code）
-#       auto = 自動判定（飛行中依環境切換）
 mission:
-  mode: 2                        # 手動設 1 / 2，或填 "auto"
+  mode: 2
+  hybrid_enabled: true
+  auto_switch_enabled: true
+  hybrid_mode1_timeout_sec: 15
 
-# ── 起飛設定 ──────────────────────────────────────────────
 takeoff:
-  cruise_altitude_cm: 135       # 起飛後爬升到此高度開始巡邏
-  stabilize_wait_sec: 2.5        # 起飛後等待穩定時間
+  cruise_altitude_cm: 135
+  stabilize_wait_sec: 2.5
 
-# ── 走道巡檢任務（Mode 2）─────────────────────────────────
 inspection:
-  # 每條走道最多掃幾個不重複 QR Code 才進入下一段
   qr_target_count: 5
+  
+  # [新增] 起飛後的盲升參數（定速定秒，取代高度計）
+  climb_speed: 30
+  climb_duration_sec: 2.0
 
-  # 向左 roll 掃描速度（負值=左移，正值=右移）
-  roll_scan_speed: -12           # 掃描時的左右飄移速度
-
-  # 找不到新 QR 時短暫右飄回掃速度
+  # 掃描平移設定
+  roll_scan_speed: -12
   roll_rescan_speed: 12
-
-  # 掃描方向反轉前的等待時間(秒)
   rescan_wait_sec: 1.5
 
-  # ── 面板轉向與靠近設定 ─────────────────────────────────
-  # 出發面掃完後，原地轉 180 度的速度與時間
-  turn_180_yaw_speed: 50
-  turn_180_duration_sec: 2.1
-  
-  # 靠近面板判定：MiDaS 深度閾值（越大=越近）
-  panel_approach_depth: 0.55
-
-  # 靠近對向面板後向左繼續掃描的起始 roll 速度
+  # [修改] 靠近面板判定（越小越早停，原0.55改為0.45防撞）
+  panel_approach_depth: 0.45
   panel_roll_speed: -10
 
-  # ── 走道切換（繞到另一條走道）──────────────────────────
+  # 面板轉向設定
+  turn_180_speed: 35
+  turn_tolerance_deg: 8
+
+  # 走道切換（繞到另一條走道）
   aisle_change:
-    # 繞行步驟：每個 step 依序執行
-    # action: roll_left | roll_right | yaw_right | yaw_left | obstacle_forward
-    # speed: RC 速度值（0~100）
-    # duration_sec: 持續時間；0 = 用 midas_clear 判定（前方無障礙物才停）
     steps:
-      - action: roll_left          # 1. 向左飄直到無障礙物
+      - action: roll_left
         speed: 15
-        duration_sec: 0            # 0 = 用 MiDaS 判定
+        duration_sec: 0
         midas_clear_threshold: 0.20
-
-      - action: yaw_right          # 2. 向右轉 90 度
+      - action: yaw_right
         speed: 40
-        duration_sec: 1.2
-
-      - action: roll_left          # 3. 向左飄直到無障礙物（取代原本的前進避障）
+        target_deg: 90
+      - action: roll_left
         speed: 15
-        duration_sec: 0            # 0 = 用 MiDaS 判定
+        duration_sec: 0
         midas_clear_threshold: 0.20
-
-      - action: yaw_right          # 4. 再右轉 90 度（完成後將面向並繼續掃描第二走道）
+      - action: yaw_right
         speed: 40
-        duration_sec: 1.2
+        target_deg: 90
 
-# ── MiDaS 避障巡航參數（Mode 1 & Mode 2 共用）────────────
 midas:
   alt_change_interval_sec: 3.0
   alt_speed:               12
@@ -86,13 +68,12 @@ midas:
   alt_max_cm:              180
   base_forward_speed:      20
   turn_speed:              40
-  obstacle_threshold:      0.35   # 深度值 > 此值 = 有障礙物
-  clear_threshold:         0.25   # 深度值 < 此值 = 安全
+  obstacle_threshold:      0.35
+  clear_threshold:         0.25
   turn_duration_sec:       1.5
   smoothing_window:        5
-  target_found_area:       10000  # YOLO 偵測面積 > 此值切換 FORWARD
+  target_found_area:       10000
 
-# ── 前進追蹤參數（Mode 1）────────────────────────────────
 forward:
   target_area:         100000
   area_tolerance:       15000
@@ -105,7 +86,6 @@ forward:
   target_lost_timeout:  1
   max_execution_time:   30
 
-# ── 環繞掃描參數（Mode 1）────────────────────────────────
 circle:
   orbit_speed:              7
   yaw_correction_speed:     25
@@ -118,7 +98,6 @@ circle:
   kp_forward:               0.0006
   max_execution_time:       30
 
-# ── QR 掃描靠近參數（Mode 1 & 2 共用）────────────────────
 qr_scan:
   target_area:              60000
   area_tolerance:            5000
@@ -130,20 +109,19 @@ qr_scan:
   target_lost_timeout:       3
   max_execution_time:       30
   qr_scan_interval_sec:     0.30
+  direct_decode_enabled:    true
+  direct_decode_interval_sec: 0.25
   forward_when_no_decode:   true
   min_area_before_decode:   40000
   csv_file:                 "scanned_codes.csv"
+  event_csv_file:           "scan_events.csv"
 
-# ── 低電量回航 ────────────────────────────────────────────
 low_battery:
-  threshold_pct:         30     # 電量低於此值觸發回航
+  threshold_pct:         30
   check_interval_sec:     5
   return_speed:          20
   yaw_kp:               0.80
-  waypoint_radius_cm:    5
-  land_radius_cm:        5
 
-# ── 自動返航飛行控制 ──────────────────────────────────────
 return_home:
   arrive_radius_cm:    80
   hover_sec:            2.0
@@ -151,9 +129,8 @@ return_home:
   descend_speed:       -10
   target_height_cm:    50
   yaw_speed:           40
-  return_altitude_cm:  220     # 回航前先爬升到此高度（Mode 2 巡檢完成後）
+  return_altitude_cm:  150
 
-# ── RViz UDP 橋接 ─────────────────────────────────────────
 rviz_bridge:
   host: "127.0.0.1"
   port: 9999
