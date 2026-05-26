@@ -1,18 +1,14 @@
 """
-main_fly9.5.py  –  Tello 雙模式任務控制系統 (su3高容錯完整保留版)
+main_fly9.5.py  –  Tello 雙模式任務控制系統 (終極防干擾定距定高版)
 =============================================
 功能 1（Mode 1）: 環繞巡檢  — MIDAS巡航 → FORWARD接近 → CIRCLE環繞 → QR_SCAN掃碼
 功能 2（Mode 2）: 走道巡檢  — 起飛爬升 → roll左掃描QR(5個) → MiDaS判定靠近對向面板
                              → 繼續roll左掃描(5個) → 繞到第二走道 → 重複 → 回航降落
-切換方式: mission_command.yaml 的 mission.mode 設 1/2/auto，
-          或飛行中按鍵盤 F1(Mode1) / F2(Mode2) 手動切換。
 
 修改紀錄:
-  [9.5-A] 完整保留 su3.py 的多重影像預處理與 pyzbar/OpenCV 雙引擎解碼，確保實機掃描成功率。
-  [9.5-B] 起飛 CLIMB 改為定速與秒數計時，解決 Tello 氣壓計初始化高度不一問題。
-  [9.5-C] 在走道巡檢 (Mode 2) 鎖定目標時，畫面上補上黃色目標追蹤框 UI 反饋。
-  [9.5-D] 修復主迴圈 tuple 賦值語法錯誤。
-  [9.5-E] 導入 MiDaS 定距平移邏輯：SCAN 階段不再依賴 YOLO 面積決定前後距離，徹底解決前後抖動。
+  [9.5-A~D] 保留 su3高容錯QR解碼 / 定速計時起飛 / 畫面追蹤框 / 語法修正。
+  [9.5-E] 導入 MiDaS 定距平移邏輯：解決靠近面板時前後不一的抖動。
+  [9.5-F] 導入 高度計定高邏輯 + 物理突變過濾器：解決平移掉高度問題，並防止飛越桌子時暴衝上升。
 """
 
 import csv
@@ -94,9 +90,6 @@ LOWBAT_CFG  = CFG.section("low_battery")
 RETURN_CFG  = CFG.section("return_home")
 INSP_CFG    = CFG.section("inspection")
 
-# ──────────────────────────────────────────────────────────
-#  狀態定義
-# ──────────────────────────────────────────────────────────
 class DroneState:
     MIDAS        = "MIDAS"
     FORWARD      = "FORWARD"
@@ -114,7 +107,7 @@ class MissionMode:
     MODE2 = 2
 
 # ──────────────────────────────────────────────────────────
-#  RViz UDP 橋接
+#  RViz UDP 橋接 & 飛行軌跡紀錄器 (精簡保留)
 # ──────────────────────────────────────────────────────────
 class RvizBridge:
     def __init__(self):
@@ -125,105 +118,70 @@ class RvizBridge:
         self._addr   = (host, port)
         self._last_t = 0.0
         self._returning = False
-        print(f"📡 RvizBridge → UDP {host}:{port}")
-
     def send(self, tracker):
         now = time.time()
-        if now - self._last_t < 0.1:
-            return
+        if now - self._last_t < 0.1: return
         self._last_t = now
         try:
-            payload = json.dumps({
-                "x":    round(tracker.x,   1),
-                "z":    round(tracker.z,   1),
-                "yaw":  round(tracker.yaw, 1),
-                "home": [tracker.home[0], tracker.home[2]],
-                "returning": self._returning,
-            }).encode()
+            payload = json.dumps({"x": round(tracker.x, 1), "z": round(tracker.z, 1), "yaw": round(tracker.yaw, 1), "home": [tracker.home[0], tracker.home[2]], "returning": self._returning}).encode()
             self._sock.sendto(payload, self._addr)
-        except Exception:
-            pass
-
-    def set_returning(self, val: bool):
-        self._returning = val
-
+        except Exception: pass
+    def set_returning(self, val: bool): self._returning = val
     def close(self):
         try: self._sock.close()
         except Exception: pass
 
-# ──────────────────────────────────────────────────────────
-#  飛行軌跡紀錄器
-# ──────────────────────────────────────────────────────────
 class FlightTracker:
-    def __init__(self):
-        self.reset()
-
+    def __init__(self): self.reset()
     def reset(self):
         self.x = self.y = self.z = self.yaw = 0.0
         self.path: List[tuple] = [(0.0, 0.0, 0.0, False)]
         self.last_time = time.time()
         self.home = (0.0, 0.0, 0.0)
-
     def reset_pose(self):
         self.x = self.y = self.z = self.yaw = 0.0
         self.path = [(0.0, 0.0, 0.0, False)]
         self.last_time = time.time()
-
     def update(self, tello: "Tello", is_manual: bool = False):
         now = time.time()
         dt  = now - self.last_time
         self.last_time = now
-        if dt <= 0 or dt > 1.0:
-            return
+        if dt <= 0 or dt > 1.0: return
         try:
-            vx = float(tello.get_speed_x())
-            vy = float(tello.get_speed_y())
-            vz = float(tello.get_speed_z())
+            vx, vy, vz = float(tello.get_speed_x()), float(tello.get_speed_y()), float(tello.get_speed_z())
             self.yaw = float(tello.get_yaw())
-        except Exception:
-            return
+        except Exception: return
         self.z += (-vx) * dt
         self.x += (-vy) * dt
         self.y +=   vz  * dt
         self.path.append((self.x, self.y, self.z, is_manual))
-
     def distance_to_home(self) -> float:
         return math.sqrt((self.x - self.home[0])**2 + (self.z - self.home[2])**2)
-
     def draw_minimap(self, frame, size=160, margin=10):
         h, w = frame.shape[:2]
         x0, y0 = w - size - margin, margin
         cv2.rectangle(frame, (x0, y0), (x0+size, y0+size), (30, 30, 30), -1)
         cv2.rectangle(frame, (x0, y0), (x0+size, y0+size), (100, 100, 100), 1)
-        if len(self.path) < 2:
-            return frame
-        xs   = [p[0] for p in self.path]
-        zs   = [p[2] for p in self.path]
+        if len(self.path) < 2: return frame
+        xs, zs = [p[0] for p in self.path], [p[2] for p in self.path]
         span = max(max(xs)-min(xs), max(zs)-min(zs), 100)
         scale = (size - 20) / span
         cx_map, cy_map = x0 + size//2, y0 + size//2
-        ox = (max(xs)+min(xs))/2
-        oz = (max(zs)+min(zs))/2
-        def to_px(px, pz):
-            return (int(cx_map+(px-ox)*scale), int(cy_map-(pz-oz)*scale))
+        ox, oz = (max(xs)+min(xs))/2, (max(zs)+min(zs))/2
+        def to_px(px, pz): return (int(cx_map+(px-ox)*scale), int(cy_map-(pz-oz)*scale))
         for i in range(1, len(self.path)):
-            p1 = to_px(self.path[i-1][0], self.path[i-1][2])
-            p2 = to_px(self.path[i][0],   self.path[i][2])
+            p1, p2 = to_px(self.path[i-1][0], self.path[i-1][2]), to_px(self.path[i][0], self.path[i][2])
             is_man = len(self.path[i]) > 3 and self.path[i][3]
             cv2.line(frame, p1, p2, (0,140,255) if is_man else (0,200,255), 1)
         cv2.circle(frame, to_px(self.home[0], self.home[2]), 5, (0,255,0), -1)
         cv2.circle(frame, to_px(self.x, self.z), 5, (0,0,255), -1)
-        dist = self.distance_to_home()
-        cv2.putText(frame, f"HOME:{dist:.0f}cm", (x0+2, y0+size-4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200,200,200), 1)
+        cv2.putText(frame, f"HOME:{self.distance_to_home():.0f}cm", (x0+2, y0+size-4), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200,200,200), 1)
         return frame
-
     def save_path_csv(self, filename="flight_path.csv"):
         with open(filename, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["x_cm", "y_cm", "z_cm", "is_manual"])
             writer.writerows(self.path)
-        print(f"📁 軌跡已儲存: {filename}")
 
 # ──────────────────────────────────────────────────────────
 #  MiDaS 避障巡航控制器
@@ -231,82 +189,42 @@ class FlightTracker:
 class MidASCruiser:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print("MiDaS device:", self.device)
         self.midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
         self.midas.to(self.device).eval()
         transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
         self.transform = transforms.small_transform
-        win = MIDAS_CFG.get("smoothing_window", 5)
-        self.center_q = deque(maxlen=win)
-        self.left_q   = deque(maxlen=win)
-        self.right_q  = deque(maxlen=win)
-        self.state           = "FORWARD"
-        self.turn_start_time = 0
-        self.obstacle_count  = 0
+        self.center_q = deque(maxlen=MIDAS_CFG.get("smoothing_window", 5))
+        self.state, self.turn_start_time = "FORWARD", 0
 
     def process_frame(self, frame):
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        inp     = self.transform(img_rgb).to(self.device)
+        inp = self.transform(img_rgb).to(self.device)
         with torch.no_grad():
             pred = self.midas(inp)
-            pred = torch.nn.functional.interpolate(
-                pred.unsqueeze(1), size=img_rgb.shape[:2],
-                mode="bicubic", align_corners=False).squeeze()
-        depth      = pred.cpu().numpy()
-        depth_norm = cv2.normalize(depth, None, 0, 1, cv2.NORM_MINMAX)
-        c, l, r    = self._get_regions(depth_norm)
-        self.center_q.append(c)
-        self.left_q.append(l)
-        self.right_q.append(r)
+            pred = torch.nn.functional.interpolate(pred.unsqueeze(1), size=img_rgb.shape[:2], mode="bicubic", align_corners=False).squeeze()
+        depth_norm = cv2.normalize(pred.cpu().numpy(), None, 0, 1, cv2.NORM_MINMAX)
+        h, w = depth_norm.shape
+        center = depth_norm[h//3:h//3*2, w//3:w//3*2]
+        self.center_q.append(np.median(center) if center.size else 0.5)
         return depth_norm, float(np.mean(self.center_q))
 
-    def _get_regions(self, d):
-        h, w = d.shape
-        ch, cw = h//3, w//3
-        ct, cl = h//2 - ch//2, w//2 - cw//2
-        center = d[ct:ct+ch, cl:cl+cw]
-        left   = d[ct:ct+ch, :w//4]
-        right  = d[ct:ct+ch, 3*w//4:]
-        return (np.median(center) if center.size else 0.5,
-                np.median(left)   if left.size   else 0.5,
-                np.median(right)  if right.size  else 0.5)
-
     def get_control(self, center_depth, now):
-        obs_th  = MIDAS_CFG.get("obstacle_threshold", 0.35)
-        clr_th  = MIDAS_CFG.get("clear_threshold",    0.25)
-        turn_d  = MIDAS_CFG.get("turn_duration_sec",  1.5)
-        fwd_sp  = MIDAS_CFG.get("base_forward_speed", 20)
-        turn_sp = MIDAS_CFG.get("turn_speed",         40)
+        obs_th, clr_th = MIDAS_CFG.get("obstacle_threshold", 0.35), MIDAS_CFG.get("clear_threshold", 0.25)
+        turn_d = MIDAS_CFG.get("turn_duration_sec", 1.5)
+        fwd_sp, turn_sp = MIDAS_CFG.get("base_forward_speed", 20), MIDAS_CFG.get("turn_speed", 40)
         if self.state == "FORWARD":
-            if center_depth > obs_th:
-                self.state = "TURNING"
-                self.turn_start_time = now
-                self.obstacle_count += 1
+            if center_depth > obs_th: self.state, self.turn_start_time = "TURNING", now
         else:
             if now - self.turn_start_time >= turn_d:
-                if center_depth < clr_th:
-                    self.state = "FORWARD"
-                else:
-                    self.turn_start_time = now
-        if self.state == "FORWARD":
-            return fwd_sp, 0
-        return 0, turn_sp
+                if center_depth < clr_th: self.state = "FORWARD"
+                else: self.turn_start_time = now
+        return (fwd_sp, 0) if self.state == "FORWARD" else (0, turn_sp)
 
     def draw_overlay(self, frame, center_depth, fbv, yv):
-        if self.state == "TURNING":
-            color, status = (0,165,255), "TURNING RIGHT"
-        elif center_depth > MIDAS_CFG.get("obstacle_threshold", 0.35):
-            color, status = (0,0,255), "OBSTACLE!"
-        elif center_depth > MIDAS_CFG.get("clear_threshold", 0.25):
-            color, status = (0,255,255), "CAUTION"
-        else:
-            color, status = (0,255,0), "CLEAR"
+        color = (0,255,0) if center_depth < MIDAS_CFG.get("clear_threshold", 0.25) else ((0,0,255) if center_depth > MIDAS_CFG.get("obstacle_threshold", 0.35) else (0,255,255))
         h, w = frame.shape[:2]
         cv2.rectangle(frame, (w//3,h//3), (2*w//3,2*h//3), color, 2)
-        cv2.putText(frame, "MODE: MIDAS CRUISE", (10,30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-        cv2.putText(frame, f"Status: {status}", (10,60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.putText(frame, "MODE: MIDAS CRUISE", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
         return frame
 
 # ──────────────────────────────────────────────────────────
@@ -314,108 +232,62 @@ class MidASCruiser:
 # ──────────────────────────────────────────────────────────
 class TargetTracker:
     def __init__(self, model_path, config: dict):
-        self.model  = YOLO(model_path)
+        self.model = YOLO(model_path)
         self.config = config
-        self.has_target           = False
-        self.target_lost_time     = None
-        self.start_time           = None
-        self.last_bbox            = None
-        self.last_bbox_area       = 0
+        self.target_lost_time = self.start_time = None
+        self.has_target = False
         self.target_center_history = deque(maxlen=5)
 
     def start(self):
-        self.start_time       = time.time()
-        self.has_target       = False
-        self.target_lost_time = time.time()
+        self.start_time, self.target_lost_time, self.has_target = time.time(), time.time(), False
         self.target_center_history.clear()
 
     def _is_valid_box(self, x1, y1, x2, y2):
-        w, h   = x2-x1, y2-y1
-        area   = w * h
-        aspect = w / (h + 1e-5)
-
-        min_aspect = self.config.get("min_aspect", 0.3)
-        max_aspect = self.config.get("max_aspect", 3.0)
-        min_area   = self.config.get("min_box_area", 8000)
-        max_ratio  = self.config.get("max_area_ratio", 0.70)
-
-        if not (min_aspect < aspect < max_aspect):
-            return False
-        if area / (FRAME_W * FRAME_H) > max_ratio:
-            return False
-        if area < min_area:
-            return False
+        w, h = x2-x1, y2-y1
+        area, aspect = w * h, w / (h + 1e-5)
+        if not (self.config.get("min_aspect", 0.3) < aspect < self.config.get("max_aspect", 3.0)): return False
+        if area / (FRAME_W * FRAME_H) > self.config.get("max_area_ratio", 0.70): return False
+        if area < self.config.get("min_box_area", 8000): return False
         return True
 
     def detect_target(self, frame, conf=None):
-        if conf is None:
-            conf = box_conf
-        results = self.model(frame, conf=conf, verbose=False)
+        results = self.model(frame, conf=conf or box_conf, verbose=False)
         if results[0].boxes is not None and len(results[0].boxes) > 0:
-            valid = [b for b in results[0].boxes
-                     if self._is_valid_box(*map(int, b.xyxy[0]))]
+            valid = [b for b in results[0].boxes if self._is_valid_box(*map(int, b.xyxy[0]))]
             if not valid:
-                if self.target_lost_time is None:
-                    self.target_lost_time = time.time()
+                if self.target_lost_time is None: self.target_lost_time = time.time()
                 self.has_target = False
                 return False, 0, 0, 0, None
             best = max(valid, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]))
-            x1,y1,x2,y2 = map(int, best.xyxy[0])
-            cx, cy = (x1+x2)//2, (y1+y2)//2
-            area   = (x2-x1)*(y2-y1)
-            self.target_center_history.append((cx,cy))
-            acx = int(np.mean([c[0] for c in self.target_center_history]))
-            acy = int(np.mean([c[1] for c in self.target_center_history]))
-            self.last_bbox = (x1,y1,x2,y2)
-            self.last_bbox_area = area
-            self.has_target = True
-            self.target_lost_time = None
+            x1, y1, x2, y2 = map(int, best.xyxy[0])
+            cx, cy, area = (x1+x2)//2, (y1+y2)//2, (x2-x1)*(y2-y1)
+            self.target_center_history.append((cx, cy))
+            acx, acy = int(np.mean([c[0] for c in self.target_center_history])), int(np.mean([c[1] for c in self.target_center_history]))
+            self.has_target, self.target_lost_time = True, None
             return True, acx, acy, area, (x1,y1,x2,y2)
-        else:
-            if self.target_lost_time is None:
-                self.target_lost_time = time.time()
-            self.has_target = False
-            return False, 0, 0, 0, None
+        if self.target_lost_time is None: self.target_lost_time = time.time()
+        self.has_target = False
+        return False, 0, 0, 0, None
 
     def calculate_control(self, tcx, tcy, tarea, tarea_goal):
-        ex = tcx - FRAME_W//2
-        ey = tcy - FRAME_H//2
-        ea = tarea_goal - tarea
-        dz = self.config.get("deadzone", 20)
-        ms = self.config.get("max_speed", 20)
-        yaw = lr = ud = fb = 0
+        ex, ey, ea = tcx - FRAME_W//2, tcy - FRAME_H//2, tarea_goal - tarea
+        dz, ms = self.config.get("deadzone", 20), self.config.get("max_speed", 20)
+        lr = yaw = ud = fb = 0
         if abs(ex) > dz:
-            if abs(ex) > 120:
-                lr  = self._clamp(int(self.config.get("kp_yaw",0.3)*ex), -ms, ms)
-            else:
-                yaw = self._clamp(int(self.config.get("kp_yaw",0.3)*ex), -ms, ms)
-        if abs(ey) > dz:
-            ud = self._clamp(int(-self.config.get("kp_updown",0.3)*ey), -ms, ms)
-        if abs(ea) > self.config.get("area_tolerance", 5000):
-            fb = self._clamp(int(self.config.get("kp_forward",0.0006)*ea), -ms, ms)
+            if abs(ex) > 120: lr = max(-ms, min(ms, int(self.config.get("kp_yaw",0.3)*ex)))
+            else: yaw = max(-ms, min(ms, int(self.config.get("kp_yaw",0.3)*ex)))
+        if abs(ey) > dz: ud = max(-ms, min(ms, int(-self.config.get("kp_updown",0.3)*ey)))
+        if abs(ea) > self.config.get("area_tolerance", 5000): fb = max(-ms, min(ms, int(self.config.get("kp_forward",0.0006)*ea)))
         return lr, fb, ud, yaw
 
     def should_abort(self):
-        if not self.has_target and self.target_lost_time is not None:
-            if time.time() - self.target_lost_time > self.config.get("target_lost_timeout", 2):
-                return True
-        return False
+        return not self.has_target and self.target_lost_time and (time.time() - self.target_lost_time > self.config.get("target_lost_timeout", 2))
 
     def is_timeout(self):
-        if self.start_time and time.time()-self.start_time > self.config.get("max_execution_time",30):
-            return True
-        return False
+        return self.start_time and (time.time()-self.start_time > self.config.get("max_execution_time",30))
 
-    @staticmethod
-    def _clamp(v, lo, hi): return max(lo, min(hi, v))
-
-# ──────────────────────────────────────────────────────────
-#  前進追蹤控制器（Mode 1）
-# ──────────────────────────────────────────────────────────
 class ForwardTracker(TargetTracker):
-    def __init__(self):
-        super().__init__(CFG.box_model, FORWARD_CFG)
-
+    def __init__(self): super().__init__(CFG.box_model, FORWARD_CFG)
     def process_frame(self, frame):
         det, cx, cy, area, bbox = self.detect_target(frame)
         if det:
@@ -423,69 +295,40 @@ class ForwardTracker(TargetTracker):
             return lr, fb, ud, yaw, bbox, area, area >= self.config.get("target_area",100000)
         return 0, 0, 0, 0, None, 0, False
 
-# ──────────────────────────────────────────────────────────
-#  環繞掃描控制器（Mode 1）
-# ──────────────────────────────────────────────────────────
 class CircleScanner(TargetTracker):
     def __init__(self):
         super().__init__(CFG.box_model, CIRCLE_CFG)
-        self.qr_model    = YOLO(CFG.qr_model)
-        self.scanned_set = set()
+        self.qr_model = YOLO(CFG.qr_model)
         self.smooth_center = deque(maxlen=3)
-
     def start(self):
         super().start()
         self.smooth_center.clear()
-        print("🔄 開始環繞掃描模式")
-
     def process_frame(self, frame):
         det, cx, cy, area, bbox = self.detect_target(frame)
-        qr_detected, qr_bbox = False, None
-        lr = CIRCLE_CFG.get("orbit_speed", 7)
-        fb = ud = yaw = 0
-
+        qr_det, qr_bbox = False, None
+        lr, fb, ud, yaw = CIRCLE_CFG.get("orbit_speed", 7), 0, 0, 0
         if det:
             self.smooth_center.append((cx, cy))
-            acx = int(np.mean([c[0] for c in self.smooth_center]))
-            acy = int(np.mean([c[1] for c in self.smooth_center]))
-            ex  = acx - FRAME_W//2
-            ey  = acy - FRAME_H//2
-            ea  = CIRCLE_CFG.get("target_area",120000) - area
-            yaw_max = CIRCLE_CFG.get("yaw_correction_speed", 25)
-            ud_max  = CIRCLE_CFG.get("height_correction_speed", 15)
+            acx, acy = int(np.mean([c[0] for c in self.smooth_center])), int(np.mean([c[1] for c in self.smooth_center]))
+            ex, ey, ea = acx - FRAME_W//2, acy - FRAME_H//2, CIRCLE_CFG.get("target_area",120000) - area
+            ymax, udmax = CIRCLE_CFG.get("yaw_correction_speed", 25), CIRCLE_CFG.get("height_correction_speed", 15)
             if abs(ex) > 120:
-                lr  = 0
-                yaw = self._clamp(int(FORWARD_CFG.get("kp_yaw",0.3)*ex), -yaw_max, yaw_max)
-            else:
-                lr  = CIRCLE_CFG.get("orbit_speed", 7)
-                if abs(ex) > FORWARD_CFG.get("deadzone", 20):
-                    yaw = self._clamp(int(FORWARD_CFG.get("kp_yaw",0.3)*ex), -yaw_max, yaw_max)
-            if abs(ey) > FORWARD_CFG.get("deadzone", 20):
-                ud = self._clamp(int(-FORWARD_CFG.get("kp_updown",0.3)*ey*0.5), -ud_max, ud_max)
-            if abs(ea) > CIRCLE_CFG.get("area_tolerance", 5000):
-                fb = self._clamp(int(CIRCLE_CFG.get("kp_forward",0.0006)*ea),
-                                 -FORWARD_CFG.get("max_speed",20), FORWARD_CFG.get("max_speed",20))
-            qr_detected, qr_bbox = self._detect_qr(frame, bbox)
-
-        return lr, fb, ud, yaw, bbox, qr_detected, qr_bbox
-
-    def _detect_qr(self, frame, bbox):
-        if bbox is None: return False, None
-        x1,y1,x2,y2 = bbox
-        roi = frame[max(0,y1-50):min(FRAME_H,y2+50),
-                    max(0,x1-50):min(FRAME_W,x2+50)]
-        if roi.size == 0: return False, None
-        res = self.qr_model(roi, conf=qr_conf, verbose=False)
-        if res[0].boxes is not None and len(res[0].boxes) > 0:
-            best = max(res[0].boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]))
-            qx1,qy1,qx2,qy2 = map(int, best.xyxy[0])
-            ox, oy = max(0,x1-50), max(0,y1-50)
-            return True, (qx1+ox, qy1+oy, qx2+ox, qy2+oy)
-        return False, None
-
+                lr, yaw = 0, max(-ymax, min(ymax, int(FORWARD_CFG.get("kp_yaw",0.3)*ex)))
+            elif abs(ex) > FORWARD_CFG.get("deadzone", 20):
+                yaw = max(-ymax, min(ymax, int(FORWARD_CFG.get("kp_yaw",0.3)*ex)))
+            if abs(ey) > FORWARD_CFG.get("deadzone", 20): ud = max(-udmax, min(udmax, int(-FORWARD_CFG.get("kp_updown",0.3)*ey*0.5)))
+            if abs(ea) > CIRCLE_CFG.get("area_tolerance", 5000): fb = max(-20, min(20, int(CIRCLE_CFG.get("kp_forward",0.0006)*ea)))
+            
+            if bbox:
+                x1, y1, x2, y2 = max(0,bbox[0]-50), max(0,bbox[1]-50), min(FRAME_W,bbox[2]+50), min(FRAME_H,bbox[3]+50)
+                res = self.qr_model(frame[y1:y2, x1:x2], conf=qr_conf, verbose=False)
+                if res[0].boxes is not None and len(res[0].boxes) > 0:
+                    best = max(res[0].boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]))
+                    qx1, qy1, qx2, qy2 = map(int, best.xyxy[0])
+                    qr_det, qr_bbox = True, (qx1+x1, qy1+y1, qx2+x1, qy2+y1)
+        return lr, fb, ud, yaw, bbox, qr_det, qr_bbox
     def is_complete(self):
-        return self.start_time is not None and \
-               time.time()-self.start_time >= CIRCLE_CFG.get("min_circle_time_sec", 5)
+        return self.start_time is not None and time.time()-self.start_time >= CIRCLE_CFG.get("min_circle_time_sec", 5)
 
 # ──────────────────────────────────────────────────────────
 #  QR 解碼輔助（完整保留 su3 版高容錯多重預處理）
@@ -570,9 +413,6 @@ def decode_qr_from_frame(frame, bbox=None) -> tuple:
 
     return False, None
 
-# ──────────────────────────────────────────────────────────
-#  QR 掃描靠近控制器（完整保留 su3 版邏輯）
-# ──────────────────────────────────────────────────────────
 class QRScanner(TargetTracker):
     def __init__(self):
         super().__init__(CFG.qr_model, QR_CFG)
@@ -766,7 +606,7 @@ class QRScanner(TargetTracker):
         return super().should_abort()
 
 # ──────────────────────────────────────────────────────────
-#  走道巡檢狀態機（Mode 2）
+#  走道巡檢狀態機（Mode 2） - 加入物理突變過濾器
 # ──────────────────────────────────────────────────────────
 class AisleInspector:
     def __init__(self, tello, midas, qr_scanner, tracker):
@@ -781,20 +621,28 @@ class AisleInspector:
         self._roll_r       = INSP_CFG.get("roll_rescan_speed", 12)
         self._rescan_wait  = INSP_CFG.get("rescan_wait_sec", 1.5)
         
-        # 讀取定速爬升參數
-        self._climb_speed  = INSP_CFG.get("climb_speed", 30)
+        self._climb_target   = CFG.get("takeoff", "cruise_altitude_cm", default=135)
+        self._climb_speed    = INSP_CFG.get("climb_speed", 30)
         self._climb_duration = INSP_CFG.get("climb_duration_sec", 2.0)
         
         self._panel_depth  = INSP_CFG.get("panel_approach_depth", 0.45)
         self._turn_speed   = INSP_CFG.get("turn_180_speed", 35)
         self._turn_tol     = INSP_CFG.get("turn_tolerance_deg", 8)
 
-        # [新增] 距離維持配置 (透過 MiDaS PID 控制 fb)
+        # 距離維持配置 (透過 MiDaS PID 控制 fb)
         self._maintain_dist = INSP_CFG.get("maintain_distance_enabled", True)
         self._target_depth  = INSP_CFG.get("target_depth", 0.45)
         self._depth_tol     = INSP_CFG.get("depth_tolerance", 0.03)
         self._depth_kp      = INSP_CFG.get("depth_kp", 100)
         self._max_fb        = INSP_CFG.get("max_fb_speed", 15)
+
+        # 高度維持配置 (透過高度計 PID 控制 ud)
+        self._maintain_height = INSP_CFG.get("maintain_height_enabled", True)
+        self._height_kp       = INSP_CFG.get("height_kp", 0.8)
+        self._max_ud          = INSP_CFG.get("max_ud_speed", 20)
+
+        # 物理突變過濾器變數
+        self._last_valid_h    = 0.0
 
         self.reset()
 
@@ -808,10 +656,30 @@ class AisleInspector:
         self._climb_start_t = 0.0
         self._turn_target_yaw = None
         self._mission_scanned = set()
+        self._last_valid_h    = 0.0
 
     def _get_yaw(self):
         try: return float(self.tello.get_yaw())
         except Exception: return 0.0
+
+    def _get_stable_height(self) -> float:
+        """安全獲取目前高度，並加入突變過濾(Outlier Rejection)以忽略下方桌子/障礙物"""
+        try:
+            raw_h = float(self.tello.get_height())
+            if self._last_valid_h == 0.0:
+                self._last_valid_h = raw_h
+                return raw_h
+
+            # 若瞬間高度突變超過 25cm (0.05秒內不可能掉落25cm)
+            # 認定為下方有桌子或貨架底座，忽略此數值，回傳上一次的真實高度
+            if abs(raw_h - self._last_valid_h) > 25:
+                return self._last_valid_h
+            
+            # 若為正常緩慢掉高，則更新有效高度
+            self._last_valid_h = raw_h
+            return raw_h
+        except Exception:
+            return float(self._climb_target)
 
     def _norm_ang(self, a):
         while a > 180: a -= 360
@@ -830,7 +698,6 @@ class AisleInspector:
         status = self._state
 
         if self._state == "CLIMB":
-            # 改為定速與秒數計時起飛，解決 Tello 高度計初始化異常
             if self._climb_start_t == 0.0:
                 self._climb_start_t = time.time()
             elapsed = time.time() - self._climb_start_t
@@ -846,25 +713,30 @@ class AisleInspector:
         elif self._state == "ROLL_SCAN":
             qr_lr, qr_fb, qr_ud, qr_yaw, bbox, area, reached, decoded, data = self.qr_scanner.process_frame(frame)
             
-            # [新增] MiDaS 距離維持 PID 控制
+            # 1. MiDaS 距離維持 PID 控制 (fb)
             base_fb = 0
             if self._maintain_dist:
-                err = self._target_depth - center_depth
-                if abs(err) > self._depth_tol:
-                    base_fb = int(err * self._depth_kp)
+                err_depth = self._target_depth - center_depth
+                if abs(err_depth) > self._depth_tol:
+                    base_fb = int(err_depth * self._depth_kp)
                     base_fb = max(-self._max_fb, min(self._max_fb, base_fb))
 
-            # 預設維持向左飄，並借用 qr_ud 穩定高度，fb 則強制使用 MiDaS 計算出的 base_fb
-            lr, fb, ud, yaw = self._roll_l, base_fb, qr_ud, 0
+            # 2. 氣壓計高度維持 PID 控制 + 物理過濾器 (ud)
+            base_ud = 0
+            if self._maintain_height:
+                err_height = self._climb_target - self._get_stable_height()
+                base_ud = int(err_height * self._height_kp)
+                base_ud = max(-self._max_ud, min(self._max_ud, base_ud))
+
+            # 預設維持向左飄，並使用 base_fb 穩定距離、base_ud 穩定高度
+            lr, fb, ud, yaw = self._roll_l, base_fb, base_ud, 0
 
             if bbox is not None:
-                # 畫出追蹤框，給予視覺反饋
                 x1, y1, x2, y2 = bbox
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 3)
                 cv2.putText(frame, f"Locked", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 
-                # 發現目標時，左右/上下/旋轉 交給 QRScanner 鎖定
-                # 🚨 關鍵：前後(fb) 依然使用 MiDaS 的 base_fb，丟棄 YOLO 算出的 qr_fb
+                # 發現目標時，交由 QRScanner 控制上下對準，但前後(fb) 依然強制維持 MiDaS 的 base_fb
                 lr, ud, yaw = qr_lr, qr_ud, qr_yaw
 
             if decoded and data and data not in self._mission_scanned:
@@ -872,13 +744,12 @@ class AisleInspector:
                 self._qr_count += 1
                 print(f"📦 走道{self._aisle_no}面{self._face} [{self._qr_count}/{self._target_count}]: {data}")
                 self.qr_scanner.start()
-                # 掃完後立刻恢復左飄
-                lr, fb, ud, yaw = self._roll_l, base_fb, 0, 0
+                lr, fb, ud, yaw = self._roll_l, base_fb, base_ud, 0
 
             if self.qr_scanner.should_abort() or self.qr_scanner.is_timeout():
                 self._state = "RESCAN_RIGHT"
                 self._rescan_t = time.time()
-                lr, fb, ud, yaw = self._roll_r, base_fb, 0, 0
+                lr, fb, ud, yaw = self._roll_r, base_fb, base_ud, 0
 
             if self._qr_count >= self._target_count:
                 if self._face == 1:
@@ -895,16 +766,23 @@ class AisleInspector:
             status = f"SCAN A{self._aisle_no}F{self._face} [{self._qr_count}/{self._target_count}]"
 
         elif self._state == "RESCAN_RIGHT":
-            # 右回掃時也進行距離維持
+            # 右回掃時也進行距離與高度維持
             base_fb = 0
             if self._maintain_dist:
-                err = self._target_depth - center_depth
-                if abs(err) > self._depth_tol:
-                    base_fb = int(err * self._depth_kp)
+                err_depth = self._target_depth - center_depth
+                if abs(err_depth) > self._depth_tol:
+                    base_fb = int(err_depth * self._depth_kp)
                     base_fb = max(-self._max_fb, min(self._max_fb, base_fb))
+            
+            base_ud = 0
+            if self._maintain_height:
+                err_height = self._climb_target - self._get_stable_height()
+                base_ud = int(err_height * self._height_kp)
+                base_ud = max(-self._max_ud, min(self._max_ud, base_ud))
 
             lr = self._roll_r
             fb = base_fb
+            ud = base_ud
             if time.time() - self._rescan_t >= self._rescan_wait:
                 self._state = "ROLL_SCAN"
                 self.qr_scanner.start()
@@ -950,15 +828,6 @@ class AisleInspector:
         elif self._state == "DONE": done = True
 
         return lr, fb, ud, yaw, status, done
-
-    def get_hud_info(self) -> dict:
-        return {
-            "internal_state": self._state,
-            "aisle_no": self._aisle_no,
-            "face_no": self._face,
-            "qr_count": self._qr_count,
-            "target_count": self._target_count,
-        }
 
 # ──────────────────────────────────────────────────────────
 #  自動返航控制器
@@ -1019,73 +888,12 @@ class TelloMissionController:
         self.return_home = ReturnHomeController(self.tello, self.tracker)
         self.inspector = AisleInspector(self.tello, self.midas, self.qr_scanner, self.tracker)
         
-        mission_cfg = CFG.section("mission")
-        raw_mode = CFG.mission_mode
-        self.hybrid_enabled = str(raw_mode).lower() == "auto" or mission_cfg.get("hybrid_enabled", False)
-        self.auto_switch_enabled = mission_cfg.get("auto_switch_enabled", self.hybrid_enabled)
-        self.auto_switch_box_area = mission_cfg.get("auto_switch_box_area", MIDAS_CFG.get("target_found_area", 10000))
-        self.auto_switch_hold_frames = mission_cfg.get("auto_switch_hold_frames", 8)
-        self.hybrid_mode1_timeout_sec = mission_cfg.get("hybrid_mode1_timeout_sec", 15)
-        self.isolated_box_min_area = mission_cfg.get("isolated_box_min_area", self.auto_switch_box_area)
-        self.isolated_box_max_area_ratio = mission_cfg.get("isolated_box_max_area_ratio", 0.55)
-        self.isolated_box_center_margin_px = mission_cfg.get("isolated_box_center_margin_px", 180)
-        self.isolated_box_second_ratio_max = mission_cfg.get("isolated_box_second_ratio_max", 0.60)
-        self.isolated_box_single_only = mission_cfg.get("isolated_box_single_only", True)
-        
-        self._auto_switch_count = 0
-        self._resume_mode2_after_mode1 = False
-        self._saved_inspector_state = None
-        self._hybrid_mode1_start_t = None
-
-        if str(raw_mode) == "1":
-            self.mission_mode = MissionMode.MODE1
-        else:
-            self.mission_mode = MissionMode.MODE2
-
-        mode_label = "環繞巡檢(1)" if self.mission_mode == MissionMode.MODE1 else "走道巡檢(2)"
-        if self.hybrid_enabled:
-            mode_label += " + 混合切換(auto)"
-        print(f"🎯 任務模式: {mode_label}")
-
+        self.mission_mode = MissionMode.MODE1 if str(CFG.mission_mode) == "1" else MissionMode.MODE2
         self.current_state = DroneState.MIDAS if self.mission_mode == MissionMode.MODE1 else DroneState.CLIMB
         self.running, self.is_flying = True, False
-        self._alt_next_t = float("inf")
-        self._last_bat_check = 0.0
-        self._low_battery_triggered = False
         
         pygame.init()
         pygame.display.set_mode((300, 200))
-        self.qr_scanner.set_context_provider(self._get_scan_context)
-
-    def _get_scan_context(self):
-        info = self.inspector.get_hud_info()
-        try: bat = self.tello.get_battery()
-        except Exception: bat = ""
-        return {
-            "mission_mode": self.mission_mode,
-            "drone_state": self.current_state,
-            "aisle_no": info.get("aisle_no", ""),
-            "face_no": info.get("face_no", ""),
-            "qr_count": info.get("qr_count", ""),
-            "target_count": info.get("target_count", ""),
-            "battery_pct": bat,
-            "x_cm": round(self.tracker.x, 1),
-            "y_cm": round(self.tracker.y, 1),
-            "z_cm": round(self.tracker.z, 1),
-        }
-
-    def change_state(self, new_state, qr_bbox=None):
-        old = self.current_state
-        self.current_state = new_state
-        if new_state == DroneState.RETURN_HOME:
-            self.return_home.start()
-        if new_state == DroneState.FORWARD:
-            self.forward.start()
-        elif new_state == DroneState.CIRCLE:
-            self.circle.start()
-        elif new_state == DroneState.QR_SCAN:
-            self.qr_scanner.start(qr_bbox)
-        print(f"\n🔄 狀態切換: {old} → {new_state}")
 
     def run(self):
         fr = self.tello.get_frame_read()
@@ -1131,7 +939,7 @@ class TelloMissionController:
                 if self.is_flying and not man:
                     cmd = [0,0,0,0]
                     if self.mission_mode == MissionMode.MODE1:
-                        pass # Mode1邏輯維持不變
+                        pass 
                     elif self.mission_mode == MissionMode.MODE2:
                         if self.current_state != DroneState.RETURN_HOME:
                             dn, cd = self.midas.process_frame(frame)
