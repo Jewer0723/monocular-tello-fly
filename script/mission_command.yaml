@@ -55,14 +55,14 @@ inspection:
     steps:
       - action: roll_left
         speed: 15
-        duration_sec: 0
+        duration_sec: 3
         midas_clear_threshold: 0.20
       - action: yaw_right
         speed: 40
         target_deg: 90
       - action: roll_left
         speed: 15
-        duration_sec: 0
+        duration_sec: 3
         midas_clear_threshold: 0.20
       - action: yaw_right
         speed: 40
@@ -124,7 +124,7 @@ qr_scan:
   event_csv_file:           "scan_events.csv"
 
 low_battery:
-  threshold_pct:         20
+  threshold_pct:         10
   check_interval_sec:     5
   return_speed:          20
   yaw_kp:               0.80

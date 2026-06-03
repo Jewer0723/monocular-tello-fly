@@ -721,7 +721,7 @@ class AisleInspector:
                 step     = self._aisle_steps[self._step_idx]
                 action   = step.get("action", "")
                 speed    = int(step.get("speed", 20))
-                duration = float(step.get("duration_sec", 0))
+                duration = float(step.get("duration_sec", 2))
                 clr_th   = step.get("midas_clear_threshold", MIDAS_CFG.get("clear_threshold", 0.25))
                 target_deg = float(step.get("target_deg", 0))
 
