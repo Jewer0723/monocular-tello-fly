@@ -31,10 +31,10 @@ inspection:
 
   # [新增] 利用 MiDaS 維持掃描時與貨架的固定距離 (PID控制)
   maintain_distance_enabled: true
-  target_depth: 0.2          # 預期維持的深度 (建議與 panel_approach_depth 一致)
-  depth_tolerance: 0.01       # 容許誤差範圍 (Deadzone)
-  depth_kp: 100               # 深度差異轉換為前後速度的比例係數
-  max_fb_speed: 20            # 前後修正的最大速度 (避免修正過猛)
+  target_depth: 0.5          # 預期維持的深度 (建議與 panel_approach_depth 一致)
+  depth_tolerance: 0.06       # 容許誤差範圍 (Deadzone)
+  depth_kp: 45             # 深度差異轉換為前後速度的比例係數
+  max_fb_speed: 8            # 前後修正的最大速度 (避免修正過猛)
 
   # 靠近面板判定（越小越早停，0.35防撞）
   panel_approach_depth: 0.2
