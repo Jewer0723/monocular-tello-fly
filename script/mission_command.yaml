@@ -32,7 +32,14 @@ inspection:
   depth_kp: 45               # 深度差異轉換為前後速度的比例係數
   max_fb_speed: 8            # 前後修正的最大速度 (避免修正過猛)
 
-  # 靠近面板判定（越小越早停，0.45防撞）
+  # [su4.3 新增] 利用氣壓計高度計維持掃描高度 (PID控制 + 物理突變過濾器)
+  backup_altitude: 80 # 備用高度
+  left_offset_before_hold_sec: 0.5
+  maintain_height_enabled: true
+  height_kp: 0.8             # 高度誤差轉換為上下速度的比例係數
+  max_ud_speed: 20           # 上下修正的最大速度
+
+  # 靠近面板判定（越小越早停，0.5防撞）
   panel_approach_depth: 0.5
   panel_roll_speed: -10
 
