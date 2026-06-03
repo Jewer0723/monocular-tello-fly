@@ -24,7 +24,7 @@ takeoff:
   stabilize_wait_sec: 2.5
 
 inspection:
-  qr_target_count: 6
+  qr_target_count: 5
   
   # 起飛後的盲升參數（定速定秒，取代高度計）
   climb_speed: 10
