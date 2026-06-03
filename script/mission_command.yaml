@@ -26,18 +26,24 @@ takeoff:
 inspection:
   qr_target_count: 5
   
+  # 起飛後的盲升參數（定速定秒，取代高度計）
+  climb_speed: 10
+  climb_duration_sec: 2.0
+
   # 掃描平移設定
-  roll_scan_speed: -20
+  roll_scan_speed: -10
+  roll_rescan_speed: 10
+  rescan_wait_sec: 2.0
 
   # [新增] 利用 MiDaS 維持掃描時與貨架的固定距離 (PID控制)
   maintain_distance_enabled: true
-  target_depth: 0.5          # 預期維持的深度 (建議與 panel_approach_depth 一致)
-  depth_tolerance: 0.06       # 容許誤差範圍 (Deadzone)
-  depth_kp: 45             # 深度差異轉換為前後速度的比例係數
-  max_fb_speed: 8            # 前後修正的最大速度 (避免修正過猛)
+  target_depth: 0.45          # 預期維持的深度 (建議與 panel_approach_depth 一致)
+  depth_tolerance: 0.03       # 容許誤差範圍 (Deadzone)
+  depth_kp: 100               # 深度差異轉換為前後速度的比例係數
+  max_fb_speed: 15            # 前後修正的最大速度 (避免修正過猛)
 
-  # 靠近面板判定（越小越早停，0.35防撞）
-  panel_approach_depth: 0.5
+  # 靠近面板判定（越小越早停，0.45防撞）
+  panel_approach_depth: 0.45
   panel_roll_speed: -10
 
   # 面板轉向設定
