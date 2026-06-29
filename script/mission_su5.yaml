@@ -1,0 +1,73 @@
+# 建議加入/覆蓋到 mission_command.yaml
+# 這些參數是給 su4_optimized.py 使用；若未加入，程式也會使用內建預設值。
+
+control:
+  # 自動模式每次 rc 指令最大變化量，越小越穩但反應越慢
+  max_rc_delta: 8
+
+midas:
+  # su4_optimized 預設關閉隨機高度，改用定高
+  random_alt_enabled: false
+  target_height_cm: 100
+  height_deadzone_cm: 10
+  height_kp: 0.30
+  height_kd: 0.05
+  height_max_ud: 14
+  height_smoothing_alpha: 0.35
+  max_ud_delta: 4
+
+qr_scan:
+  qr_scan_interval_sec: 0.22
+  direct_decode_enabled: true
+  direct_decode_interval_sec: 0.20
+  bbox_hold_sec: 0.35
+  same_data_cooldown_sec: 1.2
+  max_decode_candidates: 4
+  min_box_area: 200
+  min_area_before_decode: 30000
+  target_area: 60000
+  area_tolerance: 6500
+
+inspection:
+  qr_target_count: 5
+  roll_scan_speed: -10
+
+  # 高度穩定：target_height_cm <= 0 代表鎖定起飛後當下高度
+  height_hold_enabled: true
+  target_height_cm: 0
+  fallback_target_height_cm: 100
+  height_deadzone_cm: 8
+  height_kp: 0.35
+  height_kd: 0.08
+  height_max_ud: 14
+  height_smoothing_alpha: 0.35
+  max_ud_delta: 4
+
+  # 與貨架/牆面距離穩定：MiDaS EMA + PD
+  maintain_distance_enabled: true
+  target_depth: 0.50
+  depth_tolerance: 0.05
+  depth_kp: 80
+  depth_kd: 20
+  depth_smoothing_alpha: 0.35
+  max_fb_speed: 16
+  max_fb_delta: 5
+
+  # 看見 QR 時，改用 QR bbox 面積做近距離定距
+  qr_distance_enabled: true
+  qr_target_area: 60000
+  qr_area_tolerance: 6500
+  qr_distance_kp: 0.00045
+  qr_distance_max_fb: 14
+
+  # 防漏掃：看到 QR 先停/慢速鎖定，不要直接 roll 過去
+  qr_lock_hold_sec: 0.75
+  qr_lock_lr_max: 6
+  qr_lock_yaw_max: 10
+  post_decode_pause_sec: 0.35
+
+  # QR 在畫面上下位置的弱修正，疊加在高度閉迴路上
+  qr_height_enabled: true
+  qr_height_deadzone: 45
+  qr_height_kp: 0.10
+  qr_height_max_ud: 8
