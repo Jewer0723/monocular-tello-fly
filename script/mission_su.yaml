@@ -1,0 +1,166 @@
+# ============================================================
+#  mission_command.yaml – Tello 巡檢任務指令配置
+#  su4.4 QR 掃描優化版
+# ============================================================
+
+frame:
+  width: 640
+  height: 480
+  control_interval: 0.05
+
+models:
+  box_model_path:     "../model/box2.pt"
+  barcode_model_path: "../model/barcode1.pt"
+
+  # QR 掃描時畫面容易模糊，0.70 太嚴格；先用 0.35 測通，再逐步調高。
+  box_conf:  0.70
+  qr_conf:   0.35
+
+mission:
+  # Mode 2 = 走道巡檢。先關閉 hybrid，避免掃 QR 中途被箱子偵測切到 Mode 1。
+  mode: 2
+  hybrid_enabled: false
+  auto_switch_enabled: false
+
+  # 之後若要重新開 hybrid，可保留以下參數。
+  auto_switch_hold_frames: 12
+  auto_switch_box_area: 12000
+  hybrid_mode1_timeout_sec: 15
+  isolated_box_min_area: 12000
+  isolated_box_max_area_ratio: 0.55
+  isolated_box_center_margin_px: 180
+  isolated_box_second_ratio_max: 0.60
+  isolated_box_single_only: true
+
+inspection:
+  qr_target_count: 5
+
+  # 掃描平移設定：原本 -20 對 QR 解碼偏快，先降速提高成功率。
+  roll_scan_speed: -8
+
+  # 利用 MiDaS 維持掃描時與貨架的相對距離。
+  # 注意：MiDaS 的 depth 是每張畫面 normalize 後的相對值，不是真實公尺/公分。
+  maintain_distance_enabled: true
+  target_depth: 0.5
+  depth_tolerance: 0.08
+  depth_kp: 30
+  max_fb_speed: 6
+
+  # 目前 Python 主程式不使用氣壓計定高；高度主要靠起飛高度與 QR bbox 弱修正。
+  backup_altitude: 80
+  left_offset_before_hold_sec: 0.5
+  maintain_height_enabled: false
+  height_kp: 0.8
+  max_ud_speed: 20
+
+  # QR bbox 鎖定後的穩定掃描參數。
+  qr_height_enabled: true
+  qr_height_deadzone: 45
+  qr_height_kp: 0.12
+  qr_height_max_ud: 10
+  qr_lock_max_fb_speed: 8
+  qr_lock_slow_forward_speed: 4
+  qr_lock_hold_when_ready: true
+  scan_pause_after_decode_sec: 0.8
+
+  # 靠近面板判定。
+  panel_approach_depth: 0.5
+  panel_roll_speed: -10
+
+  # 面板轉向設定。
+  turn_180_speed: 35
+  turn_tolerance_deg: 8
+
+  # 走道切換（繞到另一條走道）。
+  aisle_change:
+    steps:
+      - action: roll_left
+        speed: 15
+        duration_sec: 3
+        midas_clear_threshold: 0.20
+      - action: yaw_right
+        speed: 40
+        target_deg: 90
+      - action: roll_left
+        speed: 15
+        duration_sec: 3
+        midas_clear_threshold: 0.20
+      - action: yaw_right
+        speed: 40
+        target_deg: 90
+
+midas:
+  alt_change_interval_sec: 3.0
+  alt_speed:               12
+  alt_min_cm:              50
+  alt_max_cm:              180
+  base_forward_speed:      20
+  turn_speed:              40
+  obstacle_threshold:      0.35
+  clear_threshold:         0.25
+  turn_duration_sec:       1.5
+  smoothing_window:        5
+  target_found_area:       10000
+
+forward:
+  target_area:         100000
+  area_tolerance:       15000
+  kp_yaw:               0.30
+  kp_updown:            0.30
+  kp_forward:           0.0006
+  max_speed:            20
+  deadzone:             20
+  min_area:             10000
+  target_lost_timeout:  1
+  max_execution_time:   30
+
+circle:
+  orbit_speed:              7
+  yaw_correction_speed:     25
+  height_correction_speed:  15
+  min_circle_time_sec:      5
+  max_circle_time_sec:      30
+  target_lost_timeout:      1
+  target_area:              120000
+  area_tolerance:           5000
+  kp_forward:               0.0006
+  max_execution_time:       30
+
+qr_scan:
+  # 原本 target_area=60000、min_area_before_decode=40000 對 Tello 很吃距離與畫質。
+  # 先降低門檻，讓程式較早開始嘗試解碼。
+  target_area:              30000
+  area_tolerance:            5000
+  kp_yaw:                   0.25
+  kp_updown:                0.25
+  kp_forward:               0.0006
+  max_speed:                10
+  deadzone:                 15
+  target_lost_timeout:       3
+  max_execution_time:       30
+  qr_scan_interval_sec:     0.10
+  direct_decode_enabled:    true
+  direct_decode_interval_sec: 0.10
+  forward_when_no_decode:   true
+  min_area_before_decode:   15000
+  csv_file:                 "scanned_codes.csv"
+  event_csv_file:           "scan_events.csv"
+
+low_battery:
+  threshold_pct:         10
+  check_interval_sec:     5
+  return_speed:          20
+  yaw_kp:               0.80
+
+return_home:
+  arrive_radius_cm:    30
+  hover_sec:            2.0
+  fly_speed:           50
+  descend_speed:       -10
+  target_height_cm:    50
+  yaw_speed:           40
+  return_altitude_cm:  150
+
+rviz_bridge:
+  host: "127.0.0.1"
+  port: 9999
