@@ -979,6 +979,7 @@ class TelloMissionController:
         if keys[pygame.K_2]:      force_state = DroneState.FORWARD
         if keys[pygame.K_3]:      force_state = DroneState.CIRCLE
         if keys[pygame.K_4]:      force_state = DroneState.QR_SCAN
+        if keys[pygame.K_5]:      force_state = DroneState.RETURN_HOME
 
         return (manual_active, lr, fb, ud, yv,
                 quit_flag, force_state, takeoff_cmd, land_cmd, switch_mode)
@@ -1163,7 +1164,7 @@ class TelloMissionController:
                     try:
                         self.tello.takeoff()
                         self.is_flying = True
-                        stab = CFG.get("takeoff", "stabilize_wait_sec", default=2.5)
+                        stab = CFG.get("takeoff", "stabilize_wait_sec", default=1.5)
                         print(f"⏳ 等待起飛穩定 {stab} 秒...")
                         time.sleep(stab)
                         self.tracker.reset_pose()

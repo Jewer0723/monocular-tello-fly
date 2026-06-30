@@ -20,7 +20,7 @@ mission:
   hybrid_mode1_timeout_sec: 15
 
 inspection:
-  qr_target_count: 6
+  qr_target_count: 7
 
   # 掃描平移設定
   roll_scan_speed: -15
@@ -108,7 +108,7 @@ circle:
 
 qr_scan:
   target_area:              60000
-  area_tolerance:            5000
+  area_tolerance:           5000
   kp_yaw:                   0.25
   kp_updown:                0.25
   kp_forward:               0.0006
@@ -132,7 +132,7 @@ low_battery:
 
 return_home:
   arrive_radius_cm:    30
-  hover_sec:            2.0
+  hover_sec:           2.0
   fly_speed:           50
   descend_speed:       -10
   target_height_cm:    50
