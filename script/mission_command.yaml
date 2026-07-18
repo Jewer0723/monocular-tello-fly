@@ -10,8 +10,8 @@ frame:
 models:
   box_model_path:     "../model/box2.pt"
   barcode_model_path: "../model/barcode1.pt"
-  box_conf:  0.55
-  qr_conf:   0.50
+  box_conf:  0.50
+  qr_conf:   0.70
 
 mission:
   mode: 1
@@ -131,7 +131,7 @@ low_battery:
   yaw_kp:               0.80
 
 return_home:
-  arrive_radius_cm:    30
+  arrive_radius_cm:    40
   hover_sec:           2.0
   fly_speed:           50
   descend_speed:       -10

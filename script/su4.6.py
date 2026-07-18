@@ -782,82 +782,113 @@ class AisleInspector:
 #  自動返航控制器
 # ──────────────────────────────────────────────────────────
 class ReturnHomeController:
-    ARRIVE_CM    = RETURN_CFG.get("arrive_radius_cm", 80)
-    HOVER_SEC    = RETURN_CFG.get("hover_sec",         2.0)
-    SPEED        = RETURN_CFG.get("fly_speed",         50)
-    DESCEND_SPD  = RETURN_CFG.get("descend_speed",    -10)
-    TARGET_H_CM  = RETURN_CFG.get("target_height_cm", 50)
-    YAW_SPEED    = RETURN_CFG.get("yaw_speed",         40)
-    RETURN_ALT   = RETURN_CFG.get("return_altitude_cm", 150)
+    ARRIVE_CM = RETURN_CFG.get("arrive_radius_cm", 40)
+    HOVER_SEC = RETURN_CFG.get("hover_sec", 2.0)
+    SPEED = RETURN_CFG.get("fly_speed", 50)
+    DESCEND_SPD = RETURN_CFG.get("descend_speed", -10)
+    TARGET_H_CM = RETURN_CFG.get("target_height_cm", 50)
+    YAW_SPEED = RETURN_CFG.get("yaw_speed", 40)
+    RETURN_ALT = RETURN_CFG.get("return_altitude_cm", 150)
 
     def __init__(self, tello, tracker):
-        self.tello   = tello
+        self.tello = tello
         self.tracker = tracker
-        self._phase  = "idle"
-        self._t      = 0.0
+        self._phase = "idle"
+        self._t = 0.0
         self._last_yaw_err = 0
-        self._yaw_int      = 0
+        self._yaw_int = 0
+        self._min_dist = float('inf')  # 記錄回航過程中的最短距離 (抓越過點用)
+        self._start_dist = 0.0  # 記錄開始回航時的總距離
 
     def start(self):
         dist = self.tracker.distance_to_home()
-        print(f"[ReturnHome] 啟動，距起飛點={dist:.0f}cm")
+        self._start_dist = dist
+        self._min_dist = dist
+        print(f"[ReturnHome] 啟動，距起飛點估算距離={dist:.0f}cm")
         self._phase = "fly"
-        self._t     = time.time()
+        self._t = time.time()
         self._yaw_int = 0
 
     def get_rc(self) -> list:
         if self._phase == "idle":
-            return [0,0,0,0]
+            return [0, 0, 0, 0]
 
         if self._phase == "climb":
-            try:    h = float(self.tello.get_height())
-            except: h = 80
+            try:
+                h = float(self.tello.get_height())
+            except:
+                h = 80
             if h < self.RETURN_ALT - 10:
                 return [0, 0, RETURN_CFG.get("climb_speed", 20), 0]
             else:
                 self._phase = "fly"
-                self._t     = time.time()
-                return [0,0,0,0]
+                self._t = time.time()
+                return [0, 0, 0, 0]
 
         if self._phase == "fly":
             dx = self.tracker.home[0] - self.tracker.x
             dz = self.tracker.home[2] - self.tracker.z
-            dist = math.sqrt(dx**2+dz**2) * 2.0
+
+            # [修正] 移除原本錯誤的 * 2.0 倍率，取真實計算距離
+            dist = math.sqrt(dx ** 2 + dz ** 2)
+
+            # 更新歷史最短距離
+            if dist < self._min_dist:
+                self._min_dist = dist
+
+            # 條件 1：正常進入降落半徑 (完美狀況)
             if dist <= self.ARRIVE_CM:
-                print("[ReturnHome] 到達起飛點，懸停")
+                print(f"[ReturnHome] 抵達起飛點半徑內 (誤差={dist:.0f}cm)，準備懸停降落")
                 self._phase = "hover"
-                self._t     = time.time()
-                return [0,0,0,0]
-            tgt_yaw  = math.degrees(math.atan2(dx, dz)) if (abs(dx)>0.1 or abs(dz)>0.1) else 0
-            yaw_err  = tgt_yaw - self.tracker.yaw
+                self._t = time.time()
+                return [0, 0, 0, 0]
+
+            # 條件 2：軌跡飄移防護 (Overshoot Detection)
+            # 只要距離比歷史最小值增加了 40cm，且已經飛了一段距離，代表已越過真實最近點！
+            if dist > self._min_dist + 10 and dist < self._start_dist * 0.8:
+                print(f"[ReturnHome] 軌跡飄移保護！已越過最近點(最低 {self._min_dist:.0f}cm)，強制降落")
+                self._phase = "hover"
+                self._t = time.time()
+                return [0, 0, 0, 0]
+
+            tgt_yaw = math.degrees(math.atan2(dx, dz)) if (abs(dx) > 0.1 or abs(dz) > 0.1) else 0
+            yaw_err = tgt_yaw - self.tracker.yaw
             while yaw_err > 180:  yaw_err -= 360
             while yaw_err < -180: yaw_err += 360
-            p = 0.8*yaw_err
-            self._yaw_int += yaw_err*0.01
-            self._yaw_int  = max(-100, min(100, self._yaw_int))
-            d = 0.1*(yaw_err - self._last_yaw_err)
-            yaw_cmd = int(max(-self.YAW_SPEED, min(self.YAW_SPEED, p+0.05*self._yaw_int+d)))
+            p = 0.8 * yaw_err
+            self._yaw_int += yaw_err * 0.01
+            self._yaw_int = max(-100, min(100, self._yaw_int))
+            d = 0.1 * (yaw_err - self._last_yaw_err)
+            yaw_cmd = int(max(-self.YAW_SPEED, min(self.YAW_SPEED, p + 0.05 * self._yaw_int + d)))
             self._last_yaw_err = yaw_err
+
             if abs(yaw_err) < 30:
-                fb_v = min(self.SPEED, max(10, int(dist/8)))
+                # [修正] 提升回航速度，將 /8 改為 /3，且保底速度提高至 20
+                fb_v = min(self.SPEED, max(20, int(dist / 3)))
             else:
                 fb_v = 0
-            try:    cur_h = float(self.tello.get_height())
-            except: cur_h = 80
+
+            try:
+                cur_h = float(self.tello.get_height())
+            except:
+                cur_h = 80
             ud_v = self.DESCEND_SPD if cur_h > self.TARGET_H_CM else 0
             return [0, fb_v, ud_v, yaw_cmd]
 
         if self._phase == "hover":
-            if time.time()-self._t >= self.HOVER_SEC:
+            if time.time() - self._t >= self.HOVER_SEC:
                 print("[ReturnHome] 降落")
                 self._phase = "land"
                 self.tello.land()
-            return [0,0,0,0]
+            return [0, 0, 0, 0]
 
-        return [0,0,0,0]
+        return [0, 0, 0, 0]
 
-    def is_active(self):   return self._phase != "idle"
-    def is_landing(self):  return self._phase == "land"
+    def is_active(self):
+        return self._phase != "idle"
+
+    def is_landing(self):
+        return self._phase == "land"
 
 # ──────────────────────────────────────────────────────────
 #  主控制器
@@ -1005,7 +1036,7 @@ class TelloMissionController:
             bat = self.tello.get_battery()
         except Exception:
             return
-        if bat <= LOWBAT_CFG.get("threshold_pct", 30) and not self._low_battery_triggered:
+        if bat <= LOWBAT_CFG.get("threshold_pct", 10) and not self._low_battery_triggered:
             self._low_battery_triggered = True
             print(f"🔋 低電量 {bat}%！自動返航")
             self.change_state(DroneState.RETURN_HOME)
