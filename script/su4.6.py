@@ -782,7 +782,7 @@ class AisleInspector:
 #  自動返航控制器
 # ──────────────────────────────────────────────────────────
 class ReturnHomeController:
-    ARRIVE_CM = RETURN_CFG.get("arrive_radius_cm", 40)
+    ARRIVE_CM = RETURN_CFG.get("arrive_radius_cm", 20)
     HOVER_SEC = RETURN_CFG.get("hover_sec", 2.0)
     SPEED = RETURN_CFG.get("fly_speed", 50)
     DESCEND_SPD = RETURN_CFG.get("descend_speed", -10)
