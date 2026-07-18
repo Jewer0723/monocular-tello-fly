@@ -10,11 +10,11 @@ frame:
 models:
   box_model_path:     "../model/box2.pt"
   barcode_model_path: "../model/barcode1.pt"
-  box_conf:  0.70
-  qr_conf:   0.70
+  box_conf:  0.55
+  qr_conf:   0.50
 
 mission:
-  mode: 2
+  mode: 1
   hybrid_enabled: true
   auto_switch_enabled: true
   hybrid_mode1_timeout_sec: 15
@@ -80,10 +80,10 @@ midas:
   clear_threshold:         0.25
   turn_duration_sec:       1.5
   smoothing_window:        5
-  target_found_area:       10000
+  target_found_area:       6000
 
 forward:
-  target_area:         100000
+  target_area:         70000
   area_tolerance:       15000
   kp_yaw:               0.30
   kp_updown:            0.30
@@ -101,7 +101,7 @@ circle:
   min_circle_time_sec:      5
   max_circle_time_sec:      30
   target_lost_timeout:      1
-  target_area:              120000
+  target_area:              80000
   area_tolerance:           5000
   kp_forward:               0.0006
   max_execution_time:       30
@@ -137,7 +137,7 @@ return_home:
   descend_speed:       -10
   target_height_cm:    50
   yaw_speed:           40
-  return_altitude_cm:  150
+  return_altitude_cm:  120
 
 rviz_bridge:
   host: "127.0.0.1"

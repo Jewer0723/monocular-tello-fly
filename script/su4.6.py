@@ -824,7 +824,7 @@ class ReturnHomeController:
     def start(self):
         dist = self.tracker.distance_to_home()
         print(f"[ReturnHome] 啟動，距起飛點={dist:.0f}cm")
-        self._phase = "climb"
+        self._phase = "fly"
         self._t     = time.time()
         self._yaw_int = 0
 
