@@ -421,7 +421,6 @@ class QRScanner(TargetTracker):
         self.scan_count = self.last_scan_time = self.consecutive_failures = 0
         self.scan_complete = False
         self.csv_file = QR_CFG.get("csv_file", "scanned_codes.csv")
-        self.event_csv_file = QR_CFG.get("event_csv_file", "scan_events.csv")
         self.direct_decode_enabled = QR_CFG.get("direct_decode_enabled", True)
         self.direct_decode_interval_sec = QR_CFG.get("direct_decode_interval_sec", 0.25)
         self._last_direct_decode_t = 0.0
@@ -446,31 +445,10 @@ class QRScanner(TargetTracker):
             except Exception: pass
         if not os.path.exists(self.csv_file):
             with open(self.csv_file, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(["時間", "資料"])
-        if not os.path.exists(self.event_csv_file):
-            with open(self.event_csv_file, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow([
-                    "time", "data", "duplicate", "mission_mode", "drone_state",
-                    "aisle_no", "face_no", "qr_count", "target_count",
-                    "battery_pct", "x_cm", "y_cm", "z_cm", "bbox", "bbox_area"
-                ])
+                csv.writer(f).writerow(["Time", "Data"])
 
     def set_context_provider(self, fn):
         self.context_provider = fn
-
-    def _log_event(self, data, duplicate=False, bbox=None, area=0):
-        ctx = {}
-        if self.context_provider is not None:
-            try: ctx = self.context_provider() or {}
-            except Exception: ctx = {}
-        with open(self.event_csv_file, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), data, int(bool(duplicate)),
-                ctx.get("mission_mode", ""), ctx.get("drone_state", ""), ctx.get("aisle_no", ""),
-                ctx.get("face_no", ""), ctx.get("qr_count", ""), ctx.get("target_count", ""),
-                ctx.get("battery_pct", ""), ctx.get("x_cm", ""), ctx.get("y_cm", ""),
-                ctx.get("z_cm", ""), str(bbox) if bbox is not None else "", int(area) if area is not None else 0,
-            ])
 
     def _record_decode(self, data, bbox=None, area=0):
         is_dup = data in self.scanned_set
@@ -479,7 +457,6 @@ class QRScanner(TargetTracker):
             with open(self.csv_file, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), data])
             print(f"✅ 新條碼: {data}")
-        self._log_event(data, duplicate=is_dup, bbox=bbox, area=area)
         self.scan_count += 1
         self.scan_complete = True
         self.consecutive_failures = 0
