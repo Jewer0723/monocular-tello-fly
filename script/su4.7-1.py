@@ -709,13 +709,13 @@ class AisleInspector:
         self._target_count = INSP_CFG.get("qr_target_count", 5)
         self._roll_l       = INSP_CFG.get("roll_scan_speed", -12)
         
-        self._panel_depth  = INSP_CFG.get("panel_approach_depth", 0.35)
+        self._panel_depth  = INSP_CFG.get("panel_approach_depth", 0.3)
         self._turn_speed   = INSP_CFG.get("turn_180_speed", 35)
         self._turn_tol     = INSP_CFG.get("turn_tolerance_deg", 8)
 
         # 距離維持配置 (透過 MiDaS PID 控制 fb)
         self._maintain_dist = INSP_CFG.get("maintain_distance_enabled", True)
-        self._target_depth  = INSP_CFG.get("target_depth", 0.35)
+        self._target_depth  = INSP_CFG.get("target_depth", 0.3)
         self._depth_tol     = INSP_CFG.get("depth_tolerance", 0.03)
         self._depth_kp      = INSP_CFG.get("depth_kp", 100)
         self._max_fb        = INSP_CFG.get("max_fb_speed", 20)
@@ -1247,7 +1247,7 @@ class TelloMissionController:
             "battery": self._dashboard_battery,
             "height": self._dashboard_height,
             "depth": depth_text,
-            "target_depth": f"{float(INSP_CFG.get('target_depth', 0.5)):.3f}",
+            "target_depth": f"{float(INSP_CFG.get('target_depth', 0.3)):.3f}",
             "x": f"{self.tracker.x:.1f}",
             "y": f"{self.tracker.y:.1f}",
             "z": f"{self.tracker.z:.1f}",
