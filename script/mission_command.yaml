@@ -11,7 +11,7 @@ models:
   box_model_path:     "../model/box2.pt"
   barcode_model_path: "../model/barcode1.pt"
   box_conf:  0.50
-  qr_conf:   0.60
+  qr_conf:   0.65
 
 mission:
   mode: 1
@@ -27,7 +27,7 @@ inspection:
 
   # [新增] 利用 MiDaS 維持掃描時與貨架的固定距離 (PID控制)
   maintain_distance_enabled: true
-  target_depth: 0.3         # 預期維持的深度 (建議與 panel_approach_depth 一致)
+  target_depth: 0.30         # 預期維持的深度 (建議與 panel_approach_depth 一致)
   depth_tolerance: 0.06      # 容許誤差範圍 (Deadzone)
   depth_kp: 45               # 深度差異轉換為前後速度的比例係數
   max_fb_speed: 8            # 前後修正的最大速度 (避免修正過猛)
@@ -40,7 +40,7 @@ inspection:
   max_ud_speed: 20           # 上下修正的最大速度
 
   # 靠近面板判定（越小越早停，0.5防撞）
-  panel_approach_depth: 0.3
+  panel_approach_depth: 0.30
   panel_roll_speed: -10
 
   # 面板轉向設定
