@@ -28,8 +28,8 @@ def yaw_to_quat(yaw_deg):
     q.x, q.y, q.z, q.w = 0.0, 0.0, math.sin(half), math.cos(half)
     return q
 
-def dr_to_rviz(x_cm, z_cm):
-    return z_cm * SCALE, -x_cm * SCALE, 0.0
+def dr_to_rviz(x_cm, y_cm,z_cm):
+    return z_cm * SCALE, -x_cm * SCALE, y_cm * SCALE
 
 def c(r, g, b, a=1.0):
     col = ColorRGBA(); col.r, col.g, col.b, col.a = r, g, b, a; return col
@@ -85,13 +85,13 @@ class TelloBridge:
         now = rospy.Time.now()
 
         if not self._home_set:
-            self._home_rx, self._home_ry, _ = dr_to_rviz(d["home"][0], d["home"][1])
+            self._home_rx, self._home_ry, self._home_rz = dr_to_rviz(d["home"][0], 0.0, d["home"][1])
             self._home_set = True
 
-        self._dr_rx, self._dr_ry, _ = dr_to_rviz(d["x"], d["z"])
+        self._dr_rx, self._dr_ry, self._dr_rz = dr_to_rviz(d["x"], d.get("y", 0.0), d["z"])
         self._returning = d.get("returning", False)
 
-        rx, ry, rz = self._dr_rx, self._dr_ry, 0.0
+        rx, ry, rz = self._dr_rx, self._dr_ry, self._dr_rz
 
         # TF
         q = yaw_to_quat(d["yaw"])
@@ -137,7 +137,7 @@ class TelloBridge:
             sm.type = Marker.SPHERE; sm.action = Marker.ADD
             sm.pose.position.x = rx
             sm.pose.position.y = ry
-            sm.pose.position.z = 0.15
+            sm.pose.position.z = rz + 0.15
             sm.pose.orientation.w = 1.0
             sm.scale.x = sm.scale.y = sm.scale.z = 0.08
             sm.color = c(1.0, 0.5, 0.0)   # 橘色 = DR
