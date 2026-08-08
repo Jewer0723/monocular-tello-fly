@@ -153,7 +153,7 @@ class RvizBridge:
         if now - self._last_t < 0.1: return
         self._last_t = now
         try:
-            payload = json.dumps({"x": round(tracker.x, 1), "z": round(tracker.z, 1), "yaw": round(tracker.yaw, 1), "home": [tracker.home[0], tracker.home[2]], "returning": self._returning}).encode()
+            payload = json.dumps({"x": round(tracker.x, 1), "y": round(tracker.y, 1),"z": round(tracker.z, 1), "yaw": round(tracker.yaw, 1), "home": [tracker.home[0], tracker.home[2]], "returning": self._returning}).encode()
             self._sock.sendto(payload, self._addr)
         except Exception: pass
     def set_returning(self, val: bool): self._returning = val
