@@ -132,14 +132,14 @@ low_battery:
 
 return_home:
   # 階段 1：升高設定
-  return_altitude_cm: 130       # 返航升高目標高度 (cm)
+  return_altitude_cm: 150       # 返航升高目標高度 (cm)
   climb_speed: 25              # 爬升速度 (10~100)
   # 階段 2：轉向設定
   turn_degrees: 180.0          # 原地旋轉角度 (度)
   yaw_speed: 35                # 旋轉速度 (10~100)
   yaw_tolerance_deg: 6.0       # 角度容許誤差 (度)
   # 階段 3：前進設定
-  forward_distance_cm: 20.0    # 向前直飛距離 (cm)
+  forward_distance_cm: 30.0    # 向前直飛距離 (cm)
   forward_speed: 15            # 前進飛行速度 (10~100)
   forward_timeout_sec: 2.0     # 前進超時防呆時間 (秒)
   # 階段 4：降落設定
