@@ -23,7 +23,7 @@ inspection:
   qr_target_count: 7
 
   # 掃描平移設定
-  roll_scan_speed: -10
+  roll_scan_speed: -8
 
   # [新增] 利用 MiDaS 維持掃描時與貨架的固定距離 (PID控制)
   maintain_distance_enabled: true
@@ -131,6 +131,7 @@ low_battery:
   yaw_kp:               0.80
 
 return_home:
+  custom_home_cm: [0.0, 0.0, 325.0]
   arrive_radius_cm:    20
   hover_sec:           2.0
   fly_speed:           50

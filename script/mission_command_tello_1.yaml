@@ -131,6 +131,7 @@ low_battery:
   yaw_kp:               0.80
 
 return_home:
+  custom_home_cm: [0.0, 0.0, 0.0]
   arrive_radius_cm:    20
   hover_sec:           2.0
   fly_speed:           50

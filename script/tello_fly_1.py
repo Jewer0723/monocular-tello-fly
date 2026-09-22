@@ -9,13 +9,13 @@ su4.7_dashboard.py  –  Tello 雙模式任務控制系統（三區塊單一操�
   [su4.1] 移除起飛爬升 (CLIMB) 邏輯，起飛後直接進入 ROLL_SCAN。
   [su4.1] 移除右偏回朔 (RESCAN_RIGHT) 邏輯，若掃描丟失則直接繼續向左掃描。
   [su4.1] 導入 MiDaS 定距平移邏輯：SCAN 階段不再依賴 YOLO 面積決定前後距離。
-  [su4.1-yaml] 將飛行速度、控制參數、模型路徑、任務參數集中到 mission_command.yaml。
+  [su4.1-yaml] 將飛行速度、控制參數、模型路徑、任務參數集中到 mission_command_tello_1.yaml。
   [su4.3-no-height] 保留原 su4.3 掃描流程，只移除高度計定高控制：
           - ROLL_SCAN 階段 ud 固定為 0，不再讀取/修正高度。
           - 發現 QR 目標時仍使用 QRScanner 的 lr/yaw，前後距離仍由 MiDaS base_fb 維持。
   [su4.7-dashboard] 將即時影像、MiDaS 深度圖、任務／鍵盤控制資訊整合為單一 Pygame 視窗。
           - 移除 OpenCV 的 Tello Mission Control 與 Depth Map 分離視窗。
-          - 支援調整視窗大小，版面比例可由 mission_command.yaml 的 dashboard 區塊設定。
+          - 支援調整視窗大小，版面比例可由 mission_command_tello_1.yaml 的 dashboard 區塊設定。
 """
 
 import csv
@@ -42,7 +42,7 @@ from ultralytics import YOLO
 #  YAML 任務配置載入器
 # ──────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-YAML_PATH = os.path.join(BASE_DIR, "mission_command.yaml")
+YAML_PATH = os.path.join(BASE_DIR, "mission_command_tello_1.yaml")
 
 def _resolve_project_path(path_value):
     if path_value is None:
@@ -102,7 +102,7 @@ def _validate_model_files():
         print("\n❌ 找不到 YOLO 模型檔，程式先停止，不連線 Tello。")
         for label, path in missing:
             print(f"   - {label}: {path}")
-        raise FileNotFoundError("YOLO model file missing. Check mission_command.yaml models paths.")
+        raise FileNotFoundError("YOLO model file missing. Check mission_command_tello_1.yaml models paths.")
 
 FRAME_W          = CFG.frame_w
 FRAME_H          = CFG.frame_h
@@ -170,7 +170,10 @@ class FlightTracker:
         self.x = self.y = self.z = self.yaw = 0.0
         self.path: List[tuple] = [(0.0, 0.0, 0.0, False)]
         self.last_time = time.time()
-        self.home = (0.0, 0.0, 0.0)
+        # ── 新增：從 YAML 的 return_home 區塊讀取自訂回航點 ──
+        raw_home = RETURN_CFG.get("custom_home_cm", [0.0, 0.0, 0.0])
+        self.home = (float(raw_home[0]), float(raw_home[1]), float(raw_home[2]))
+        print(f"🏠 返航目標點 (Home) 已設定為: X={self.home[0]}cm, Y={self.home[1]}cm, Z={self.home[2]}cm")
     def reset_pose(self):
         self.x = self.y = self.z = self.yaw = 0.0
         self.path = [(0.0, 0.0, 0.0, False)]
