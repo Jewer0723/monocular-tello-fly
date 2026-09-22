@@ -1013,126 +1013,108 @@ class AisleInspector:
 #  自動返航控制器
 # ──────────────────────────────────────────────────────────
 class ReturnHomeController:
-    ARRIVE_CM = RETURN_CFG.get("arrive_radius_cm", 20)
-    HOVER_SEC = RETURN_CFG.get("hover_sec", 2.0)
-    SPEED = RETURN_CFG.get("fly_speed", 50)
-    DESCEND_SPD = RETURN_CFG.get("descend_speed", -10)
-    TARGET_H_CM = RETURN_CFG.get("target_height_cm", 50)
-    YAW_SPEED = RETURN_CFG.get("yaw_speed", 40)
-    RETURN_ALT = RETURN_CFG.get("return_altitude_cm", 120)  # 安全返航高度
-    CLIMB_SPD = RETURN_CFG.get("climb_speed", 25)  # 爬升速度
+    # 從 YAML 配置檔讀取參數
+    RETURN_ALT = RETURN_CFG.get("return_altitude_cm", 120)
+    CLIMB_SPD = RETURN_CFG.get("climb_speed", 25)
+    TURN_DEG = RETURN_CFG.get("turn_degrees", 180.0)
+    YAW_SPEED = RETURN_CFG.get("yaw_speed", 35)
+    YAW_TOL = RETURN_CFG.get("yaw_tolerance_deg", 6.0)
+    FWD_DIST = RETURN_CFG.get("forward_distance_cm", 20.0)
+    FWD_SPD = RETURN_CFG.get("forward_speed", 15)
+    FWD_TIMEOUT = RETURN_CFG.get("forward_timeout_sec", 2.0)
+    HOVER_SEC = RETURN_CFG.get("hover_sec", 1.5)
 
     def __init__(self, tello, tracker):
         self.tello = tello
         self.tracker = tracker
         self._phase = "idle"
         self._t = 0.0
-        self._last_yaw_err = 0
-        self._yaw_int = 0
-        self._min_dist = float('inf')
-        self._start_dist = 0.0
+        self._target_yaw = 0.0
+        self._fwd_start_pos = (0.0, 0.0)
+
+    @staticmethod
+    def _norm_ang(a: float) -> float:
+        while a > 180:
+            a -= 360
+        while a < -180:
+            a += 360
+        return a
 
     def start(self):
-        dist = self.tracker.distance_to_home()
-        self._start_dist = dist
-        self._min_dist = dist
         try:
             cur_h = float(self.tello.get_height())
         except Exception:
             cur_h = 80.0
 
-        print(f"[ReturnHome] 啟動返航！當前高度: {cur_h:.0f}cm，目標返航高度: {self.RETURN_ALT}cm，距目標點: {dist:.0f}cm")
+        print(f"[ReturnHome] 啟動序列回航：當前高度 {cur_h:.0f}cm，目標升至 {self.RETURN_ALT}cm")
 
-        # 修正：若當前高度低於返航高度（保留 5cm 容許範圍），先進入 climb 爬升階段
+        # 步驟 1：檢查是否需要升高
         if cur_h < (self.RETURN_ALT - 5):
             self._phase = "climb"
         else:
-            self._phase = "fly"
+            self._start_turn()
 
+    def _start_turn(self):
+        # 步驟 2：旋轉指定角度
+        cur_yaw = self.tracker.yaw
+        self._target_yaw = self._norm_ang(cur_yaw + self.TURN_DEG)
+        self._phase = "turn"
+        print(f"[ReturnHome] 開始原位旋轉 {self.TURN_DEG}° (目標 Yaw: {self._target_yaw:.1f}°)")
+
+    def _start_forward(self):
+        # 步驟 3：紀錄前進起點
+        self._fwd_start_pos = (self.tracker.x, self.tracker.z)
         self._t = time.time()
-        self._yaw_int = 0
+        self._phase = "forward"
+        print(f"[ReturnHome] 轉向完成，開始向前直飛 {self.FWD_DIST}cm (速度: {self.FWD_SPD})")
 
     def get_rc(self) -> list:
         if self._phase == "idle":
             return [0, 0, 0, 0]
 
-        # ── 階段 1: 爬升至安全高度 ──
+        # ── 階段 1: 垂直升高 ──
         if self._phase == "climb":
             try:
                 h = float(self.tello.get_height())
             except Exception:
                 h = 80.0
 
-            # 尚未到達 return_altitude_cm，持續垂直上升，不進行任何水平位移
             if h < (self.RETURN_ALT - 5):
                 return [0, 0, self.CLIMB_SPD, 0]
             else:
-                print(f"[ReturnHome] 已爬升至安全高度 ({h:.0f}cm)，切換至水平返航階段")
-                self._phase = "fly"
-                self._t = time.time()
+                print(f"[ReturnHome] 已升高至目標高度 ({h:.0f}cm)")
+                self._start_turn()
                 return [0, 0, 0, 0]
 
-        # ── 階段 2: 水平飛行返回起飛點 ──
-        if self._phase == "fly":
-            dx = self.tracker.home[0] - self.tracker.x
-            dz = self.tracker.home[2] - self.tracker.z
-            dist = math.sqrt(dx ** 2 + dz ** 2)
+        # ── 階段 2: 原位旋轉 ──
+        if self._phase == "turn":
+            yaw_err = self._norm_ang(self._target_yaw - self.tracker.yaw)
 
-            if dist < self._min_dist:
-                self._min_dist = dist
+            if abs(yaw_err) <= self.YAW_TOL:
+                self._start_forward()
+                return [0, 0, 0, 0]
 
-            # 條件 1：進入降落半徑
-            if dist <= self.ARRIVE_CM:
-                print(f"[ReturnHome] 抵達目標點半徑內 (誤差={dist:.0f}cm)，準備懸停降落")
+            yaw_cmd = int(self.YAW_SPEED if yaw_err > 0 else -self.YAW_SPEED)
+            return [0, 0, 0, yaw_cmd]
+
+        # ── 階段 3: 前向平移 ──
+        if self._phase == "forward":
+            dx = self.tracker.x - self._fwd_start_pos[0]
+            dz = self.tracker.z - self._fwd_start_pos[1]
+            dist_moved = math.sqrt(dx ** 2 + dz ** 2)
+
+            if dist_moved >= self.FWD_DIST or (time.time() - self._t > self.FWD_TIMEOUT):
+                print(f"[ReturnHome] 前飛完畢 (位移約 {dist_moved:.1f}cm)，準備懸停降落")
                 self._phase = "hover"
                 self._t = time.time()
                 return [0, 0, 0, 0]
 
-            # 條件 2：飄移防護 (已越過最近點)
-            if dist > self._min_dist + 15 and dist < self._start_dist * 0.8:
-                print(f"[ReturnHome] 軌跡保護觸發！已越過最近點(最低 {self._min_dist:.0f}cm)，強制懸停降落")
-                self._phase = "hover"
-                self._t = time.time()
-                return [0, 0, 0, 0]
+            return [0, int(self.FWD_SPD), 0, 0]
 
-            # 轉向目標計算
-            tgt_yaw = math.degrees(math.atan2(dx, dz)) if (abs(dx) > 0.1 or abs(dz) > 0.1) else 0
-            yaw_err = tgt_yaw - self.tracker.yaw
-            while yaw_err > 180:  yaw_err -= 360
-            while yaw_err < -180: yaw_err += 360
-
-            p = 0.8 * yaw_err
-            self._yaw_int += yaw_err * 0.01
-            self._yaw_int = max(-100, min(100, self._yaw_int))
-            d = 0.1 * (yaw_err - self._last_yaw_err)
-            yaw_cmd = int(max(-self.YAW_SPEED, min(self.YAW_SPEED, p + 0.05 * self._yaw_int + d)))
-            self._last_yaw_err = yaw_err
-
-            # 只有在機頭大致對準目標（誤差小於 30 度）時才向前衝
-            if abs(yaw_err) < 30:
-                fb_v = min(self.SPEED, max(20, int(dist / 3)))
-            else:
-                fb_v = 0
-
-            # 回航期間的高度維持邏輯：維持在 return_altitude_cm 附近
-            try:
-                cur_h = float(self.tello.get_height())
-            except Exception:
-                cur_h = self.RETURN_ALT
-
-            if cur_h < self.RETURN_ALT - 10:
-                ud_v = 15  # 稍微偏低時補升
-            elif cur_h > self.RETURN_ALT + 20:
-                ud_v = -10  # 稍微偏高時平緩下修
-            else:
-                ud_v = 0  # 高度合適
-
-            return [0, fb_v, ud_v, yaw_cmd]
-
-        # ── 階段 3: 抵達定點懸停降落 ──
+        # ── 階段 4: 煞車懸停穩定後降落 ──
         if self._phase == "hover":
             if time.time() - self._t >= self.HOVER_SEC:
-                print("[ReturnHome] 懸停結束，執行降落")
+                print("[ReturnHome] 懸停完畢，開始執行降落")
                 self._phase = "land"
                 self.tello.land()
             return [0, 0, 0, 0]
