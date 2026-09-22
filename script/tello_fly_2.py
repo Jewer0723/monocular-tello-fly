@@ -187,9 +187,9 @@ class FlightTracker:
             vx, vy, vz = float(tello.get_speed_x()), float(tello.get_speed_y()), float(tello.get_speed_z())
             self.yaw = float(tello.get_yaw())
         except Exception: return
-        self.z += (-vx) * dt
-        self.x += (-vy) * dt
-        self.y +=   vz  * dt
+        self.z += vx * dt
+        self.x += vy * dt
+        self.y += (-vz)  * dt
         self.path.append((self.x, self.y, self.z, is_manual))
     def distance_to_home(self) -> float:
         return math.sqrt((self.x - self.home[0])**2 + (self.z - self.home[2])**2)
@@ -1019,7 +1019,8 @@ class ReturnHomeController:
     DESCEND_SPD = RETURN_CFG.get("descend_speed", -10)
     TARGET_H_CM = RETURN_CFG.get("target_height_cm", 50)
     YAW_SPEED = RETURN_CFG.get("yaw_speed", 40)
-    RETURN_ALT = RETURN_CFG.get("return_altitude_cm", 150)
+    RETURN_ALT = RETURN_CFG.get("return_altitude_cm", 120)  # 安全返航高度
+    CLIMB_SPD = RETURN_CFG.get("climb_speed", 25)  # 爬升速度
 
     def __init__(self, tello, tracker):
         self.tello = tello
@@ -1028,15 +1029,26 @@ class ReturnHomeController:
         self._t = 0.0
         self._last_yaw_err = 0
         self._yaw_int = 0
-        self._min_dist = float('inf')  # 記錄回航過程中的最短距離 (抓越過點用)
-        self._start_dist = 0.0  # 記錄開始回航時的總距離
+        self._min_dist = float('inf')
+        self._start_dist = 0.0
 
     def start(self):
         dist = self.tracker.distance_to_home()
         self._start_dist = dist
         self._min_dist = dist
-        print(f"[ReturnHome] 啟動，距起飛點估算距離={dist:.0f}cm")
-        self._phase = "fly"
+        try:
+            cur_h = float(self.tello.get_height())
+        except Exception:
+            cur_h = 80.0
+
+        print(f"[ReturnHome] 啟動返航！當前高度: {cur_h:.0f}cm，目標返航高度: {self.RETURN_ALT}cm，距目標點: {dist:.0f}cm")
+
+        # 修正：若當前高度低於返航高度（保留 5cm 容許範圍），先進入 climb 爬升階段
+        if cur_h < (self.RETURN_ALT - 5):
+            self._phase = "climb"
+        else:
+            self._phase = "fly"
+
         self._t = time.time()
         self._yaw_int = 0
 
@@ -1044,48 +1056,51 @@ class ReturnHomeController:
         if self._phase == "idle":
             return [0, 0, 0, 0]
 
+        # ── 階段 1: 爬升至安全高度 ──
         if self._phase == "climb":
             try:
                 h = float(self.tello.get_height())
-            except:
-                h = 80
-            if h < self.RETURN_ALT - 10:
-                return [0, 0, RETURN_CFG.get("climb_speed", 20), 0]
+            except Exception:
+                h = 80.0
+
+            # 尚未到達 return_altitude_cm，持續垂直上升，不進行任何水平位移
+            if h < (self.RETURN_ALT - 5):
+                return [0, 0, self.CLIMB_SPD, 0]
             else:
+                print(f"[ReturnHome] 已爬升至安全高度 ({h:.0f}cm)，切換至水平返航階段")
                 self._phase = "fly"
                 self._t = time.time()
                 return [0, 0, 0, 0]
 
+        # ── 階段 2: 水平飛行返回起飛點 ──
         if self._phase == "fly":
             dx = self.tracker.home[0] - self.tracker.x
             dz = self.tracker.home[2] - self.tracker.z
-
-            # [修正] 移除原本錯誤的 * 2.0 倍率，取真實計算距離
             dist = math.sqrt(dx ** 2 + dz ** 2)
 
-            # 更新歷史最短距離
             if dist < self._min_dist:
                 self._min_dist = dist
 
-            # 條件 1：正常進入降落半徑 (完美狀況)
+            # 條件 1：進入降落半徑
             if dist <= self.ARRIVE_CM:
-                print(f"[ReturnHome] 抵達起飛點半徑內 (誤差={dist:.0f}cm)，準備懸停降落")
+                print(f"[ReturnHome] 抵達目標點半徑內 (誤差={dist:.0f}cm)，準備懸停降落")
                 self._phase = "hover"
                 self._t = time.time()
                 return [0, 0, 0, 0]
 
-            # 條件 2：軌跡飄移防護 (Overshoot Detection)
-            # 只要距離比歷史最小值增加了 40cm，且已經飛了一段距離，代表已越過真實最近點！
-            if dist > self._min_dist + 10 and dist < self._start_dist * 0.8:
-                print(f"[ReturnHome] 軌跡飄移保護！已越過最近點(最低 {self._min_dist:.0f}cm)，強制降落")
+            # 條件 2：飄移防護 (已越過最近點)
+            if dist > self._min_dist + 15 and dist < self._start_dist * 0.8:
+                print(f"[ReturnHome] 軌跡保護觸發！已越過最近點(最低 {self._min_dist:.0f}cm)，強制懸停降落")
                 self._phase = "hover"
                 self._t = time.time()
                 return [0, 0, 0, 0]
 
+            # 轉向目標計算
             tgt_yaw = math.degrees(math.atan2(dx, dz)) if (abs(dx) > 0.1 or abs(dz) > 0.1) else 0
             yaw_err = tgt_yaw - self.tracker.yaw
             while yaw_err > 180:  yaw_err -= 360
             while yaw_err < -180: yaw_err += 360
+
             p = 0.8 * yaw_err
             self._yaw_int += yaw_err * 0.01
             self._yaw_int = max(-100, min(100, self._yaw_int))
@@ -1093,22 +1108,31 @@ class ReturnHomeController:
             yaw_cmd = int(max(-self.YAW_SPEED, min(self.YAW_SPEED, p + 0.05 * self._yaw_int + d)))
             self._last_yaw_err = yaw_err
 
+            # 只有在機頭大致對準目標（誤差小於 30 度）時才向前衝
             if abs(yaw_err) < 30:
-                # [修正] 提升回航速度，將 /8 改為 /3，且保底速度提高至 20
                 fb_v = min(self.SPEED, max(20, int(dist / 3)))
             else:
                 fb_v = 0
 
+            # 回航期間的高度維持邏輯：維持在 return_altitude_cm 附近
             try:
                 cur_h = float(self.tello.get_height())
-            except:
-                cur_h = 80
-            ud_v = self.DESCEND_SPD if cur_h > self.TARGET_H_CM else 0
+            except Exception:
+                cur_h = self.RETURN_ALT
+
+            if cur_h < self.RETURN_ALT - 10:
+                ud_v = 15  # 稍微偏低時補升
+            elif cur_h > self.RETURN_ALT + 20:
+                ud_v = -10  # 稍微偏高時平緩下修
+            else:
+                ud_v = 0  # 高度合適
+
             return [0, fb_v, ud_v, yaw_cmd]
 
+        # ── 階段 3: 抵達定點懸停降落 ──
         if self._phase == "hover":
             if time.time() - self._t >= self.HOVER_SEC:
-                print("[ReturnHome] 降落")
+                print("[ReturnHome] 懸停結束，執行降落")
                 self._phase = "land"
                 self.tello.land()
             return [0, 0, 0, 0]
